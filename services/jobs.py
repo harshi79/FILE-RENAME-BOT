@@ -43,7 +43,7 @@ class JobManager:
         self._user_lock = asyncio.Lock()
         # Track active task objects so they can be cancelled on shutdown.
         self._tasks: set[asyncio.Task] = set()
-        # Fire-and-forget background tasks (e.g. Redis counter decrement).
+        # Fire-and-forget background tasks (e.g. counter decrement).
         self._bg_tasks: set[asyncio.Task] = set()
 
     async def _user_semaphore(self, user_id: int) -> asyncio.Semaphore:
@@ -64,7 +64,7 @@ class JobManager:
         if user_active >= self._config.max_active_jobs_per_user:
             return AdmissionResult(False, "user_busy", user_active)
 
-        # Also consult the DB as a safety net in case Redis lost state.
+        # Also consult the DB as a safety net (source of truth).
         # PENDING jobs (files received, awaiting instruction) do not consume a
         # processing slot, so batch accumulation is allowed.
         try:
@@ -73,6 +73,14 @@ class JobManager:
                 return AdmissionResult(False, "user_busy", db_active)
         except Exception as exc:
             log.warning("db_admission_check_failed", extra={"error": str(exc)})
+
+        # Also check total QUEUED count in DB vs max_queue_size (so DB is truth)
+        try:
+            db_queued = await queries.count_jobs(self._db, JobStatus.QUEUED.value)
+            if db_queued >= self._config.max_queue_size:
+                return AdmissionResult(False, "queue_full", db_queued)
+        except Exception:
+            pass
 
         return AdmissionResult(True, "", queue_len + 1)
 
@@ -93,7 +101,7 @@ class JobManager:
         sem = self._user_slots.get(user_id)
         if sem is not None:
             sem.release()
-        # Decrement Redis counter best-effort (tracked so it isn't GC'd and
+        # Decrement counter best-effort (tracked so it isn't GC'd and
         # exceptions can't crash the worker).
         try:
             loop = asyncio.get_running_loop()
@@ -120,10 +128,10 @@ class JobManager:
 
         status = job["status"]
         if status == JobStatus.QUEUED.value or status == JobStatus.PENDING.value:
-            removed = await self._state.remove_from_queue(job_id)
+            await self._state.remove_from_queue(job_id)
             await queries.set_job_status(
                 self._db, job_id, JobStatus.CANCELLED,
-                error="cancelled by user" if removed == 0 else None,
+                error="cancelled by user",
             )
             await self._state.clear_cancel(job_id)
             await queries.add_history(

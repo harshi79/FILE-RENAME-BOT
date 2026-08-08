@@ -27,8 +27,7 @@ def register(app: Client, ctx: HandlerContext) -> None:
         except Exception:
             pass
 
-        # /start must NEVER require Redis. All paths below use only DB (or hard-coded config).
-        # Even if StateStore reports unavailable we still answer the welcome message.
+        # /start must NEVER require external state store. All paths below use only DB (or hard-coded config).
         user = await ctx.ensure_user(message)
         if user and user.get("is_banned"):
             await message.reply(M.ERR_BANNED)

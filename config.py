@@ -93,7 +93,6 @@ class RateLimitConfig:
 
     @classmethod
     def from_env(cls) -> "RateLimitConfig":
-        # RATE_LIMIT can override the whole window; e.g. RATE_LIMIT=60
         window = _get_int("RATE_LIMIT", 60)
         return cls(
             window_seconds=max(10, window),
@@ -112,9 +111,8 @@ class Config:
     api_hash: str
     bot_token: str
 
-    # Data stores
+    # Data store
     database_url: str
-    redis_url: str
 
     # Operators
     admin_ids: frozenset
@@ -155,14 +153,8 @@ def load_config() -> Config:
         raise ConfigurationError(f"API_ID must be an integer, got: {api_id_raw!r}") from exc
 
     db_url = _get_env("DATABASE_URL", required=True)
-    # Render/Heroku style postgres:// must be translated for asyncpg.
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
-
-    redis_url = _get_env("REDIS_URL", required=True)
-    if redis_url.startswith("rediss://"):
-        # redis-py handles rediss natively; nothing to do.
-        pass
 
     max_file_mb = _get_int("MAX_FILE_SIZE_MB", 25)
     if max_file_mb > 100:
@@ -175,7 +167,6 @@ def load_config() -> Config:
         api_hash=_get_env("API_HASH", required=True),
         bot_token=_get_env("BOT_TOKEN", required=True),
         database_url=db_url,
-        redis_url=redis_url,
         admin_ids=frozenset(_parse_admin_ids(_get_env("ADMIN_IDS", required=True))),
         max_file_size=max_file_mb * 1024 * 1024,
         max_global_active_jobs=_get_int("MAX_GLOBAL_ACTIVE_JOBS", 2),
