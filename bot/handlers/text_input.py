@@ -202,8 +202,8 @@ def register(app: Client, ctx: HandlerContext) -> None:
         queued = 0
         for item, plan in zip(items, plans):
             job_id = item["job_id"]
-            # The job is QUEUED in Postgres regardless of Redis availability;
-            # the reconciler re-pushes it if Redis was temporarily unavailable.
+            # The job is QUEUED in PostgreSQL (source of truth) and enqueued in the bounded
+            # in-process queue; the reconciler re-pushes it if the queue was lost on restart.
             await queries.set_job_plan(
                 ctx.db, job_id, operation, plan.new_name, status_msg_id=status.id,
             )

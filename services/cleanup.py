@@ -4,8 +4,8 @@ Startup / shutdown cleanup helpers.
 * Wipes stale temp directories on boot.
 * Marks jobs that were actively processing at crash time as FAILED so they are
   never stuck in DOWNLOADING / UPLOADING forever.
-* Re-enqueues QUEUED jobs that are not already in the Redis queue, so a Redis
-  flush / restart does not orphan work (PostgreSQL is the source of truth).
+* Re-enqueues QUEUED jobs into the bounded in-memory queue (PostgreSQL is
+  the source of truth; the queue is ephemeral and repopulated on restart).
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ log = get_logger(__name__)
 
 
 async def _recover_queued_jobs(db: Database, state: StateStore) -> None:
-    """Re-push any QUEUED jobs missing from the Redis queue."""
+    """Re-push any QUEUED jobs into the bounded in-memory queue."""
     try:
         queued = await queries.list_queued_jobs(db, limit=500)
     except Exception as exc:
@@ -29,14 +29,21 @@ async def _recover_queued_jobs(db: Database, state: StateStore) -> None:
         return
 
     requeued = 0
+    skipped_full = 0
     for job in queued:
         jid = str(job["id"])
-        # Avoid duplicate enqueues: remove first then push (idempotent).
-        await state.remove_from_queue(jid)
+        # Bounded enqueue: if queue is full we keep job in DB as QUEUED
+        # and the reconciler will enqueue as slots free.
         if await state.enqueue_job(jid):
             requeued += 1
+        else:
+            # Already queued or queue full
+            qlen = await state.queue_length()
+            if qlen >= getattr(state, "_max_queue_size", 20):
+                skipped_full += 1
+                continue
     if requeued:
-        log.info("requeued_orphan_jobs", extra={"count": requeued})
+        log.info("requeued_orphan_jobs", extra={"count": requeued, "skipped_full": skipped_full})
 
 
 async def recover_stale_jobs(db: Database, storage: JobStorage, job_timeout: int) -> int:

@@ -1,14 +1,15 @@
 """
 Job processor / worker pool.
 
-A small, bounded pool of consumer coroutines pulls job ids off the Redis
-queue. Each job acquires global + per-user concurrency slots, streams the file
-to a unique temp directory, renames on the filesystem, streams it back to
-Telegram, and ALWAYS cleans up in finally. Every failure is caught and
-recorded; a bad job never crashes a consumer or the bot.
+A small, bounded pool of consumer coroutines pulls job ids off the
+in-process bounded queue (StateStore). Each job acquires global + per-user
+concurrency slots, streams the file to a unique temp directory, renames on
+the filesystem, streams it back to Telegram, and ALWAYS cleans up in finally.
+Every failure is caught and recorded; a bad job never crashes a consumer.
 
 A lightweight reconciler periodically re-enqueues QUEUED jobs that are absent
-from Redis (survives a Redis flush / brief outage).
+from the in-memory queue (survives a restart where the queue was lost).
+PostgreSQL is the source of truth.
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ log = get_logger(__name__)
 PROGRESS_STEP = 15
 # Cap FloodWait sleeping so a single huge wait cannot wedge a consumer forever.
 MAX_FLOOD_WAIT = 60
-# Reconciler cadence – re-push orphan QUEUED jobs if Redis lost them.
+# Reconciler cadence – re-push orphan QUEUED jobs if in-memory queue lost them.
 RECONCILE_INTERVAL = 30
 
 
@@ -122,14 +123,19 @@ class JobProcessor:
                 queued = await queries.list_queued_jobs(self.db, limit=200)
                 for job in queued:
                     jid = str(job["id"])
-                    # Skip jobs already being processed (have an active cancel/lock).
+                    # Skip if already marked for cancellation
                     if await self.state.is_cancelled(jid):
                         continue
-                    # Best-effort: if queue length is 0 re-push; otherwise we
-                    # cannot cheaply know membership, so re-push and rely on the
-                    # terminal-state guard in _process_with_slots for dedup.
-                    if await self.state.queue_length() == 0:
-                        await self.state.enqueue_job(jid)
+                    # If already queued in memory, skip
+                    if await self.state.is_queued(jid):
+                        continue
+                    # Enqueue; if queue full, stop for this cycle
+                    ok = await self.state.enqueue_job(jid)
+                    if not ok:
+                        # queue full => will retry next cycle
+                        qlen = await self.state.queue_length()
+                        if qlen >= self.config.max_queue_size:
+                            break
             except asyncio.CancelledError:
                 break
             except Exception as exc:

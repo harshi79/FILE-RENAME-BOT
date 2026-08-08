@@ -1,8 +1,9 @@
 """
 Telegram File Renamer Bot – entrypoint.
 
-Wires configuration, database, Redis, job manager, worker and the Pyrogram
+Wires configuration, database, StateStore, job manager, worker and the Pyrogram
 client. Designed to run on a Render free web service with ~512 MB RAM.
+No Redis – PostgreSQL + bounded in-process queue are the only dependencies.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import asyncio
 import os
 import signal
 import sys
+from collections import OrderedDict
 
 from pyrogram import Client, idle
 from pyrogram.errors import RPCError
@@ -85,17 +87,52 @@ def attach_app_services(app: Client, *, jobs, storage: JobStorage, state,
     app.config = config  # type: ignore[attr-defined]
 
 
+def _patch_dispatcher_for_sync_registration(app: Client) -> None:
+    """
+    Patch Dispatcher.add_handler to be synchronous before start().
+
+    Pyrogram's Dispatcher.add_handler schedules an async task via
+    loop.create_task, so immediate inspection of app.dispatcher.groups
+    shows 0 handlers. This patch makes add_handler synchronous when
+    locks_list is empty (i.e. before Dispatcher.start()), so
+    handlers_registered logging and tests see the real count.
+    """
+    try:
+        disp = app.dispatcher
+        orig = disp.add_handler
+
+        def sync_add_handler(handler, group: int):
+            # If dispatcher hasn't started yet (no locks), add synchronously
+            if not getattr(disp, "locks_list", None):
+                # empty list/falsy -> synchronous
+                if group not in disp.groups:
+                    disp.groups[group] = []
+                    disp.groups = OrderedDict(sorted(disp.groups.items()))
+                disp.groups[group].append(handler)
+                return
+            if len(disp.locks_list) == 0:
+                if group not in disp.groups:
+                    disp.groups[group] = []
+                    disp.groups = OrderedDict(sorted(disp.groups.items()))
+                disp.groups[group].append(handler)
+                return
+            return orig(handler, group)
+
+        # Only patch if not already patched
+        if getattr(sync_add_handler, "_patched", False) is not True:
+            disp.add_handler = sync_add_handler  # type: ignore
+    except Exception:
+        pass
+
+
 async def _run() -> None:
     try:
         config = get_config()
     except ConfigurationError as exc:
-        # Print directly – logging may not be configured yet.
         print(f"[FATAL CONFIG] {exc}", file=sys.stderr)
         sys.exit(2)
 
     setup_logging("INFO")
-    # Make Pyrogram dispatcher/handler exceptions visible at ERROR level in logs.
-    # (Our JsonFormatter will emit them; we only quiet the noisy INFO chatter.)
     import logging as _logging
     _logging.getLogger("pyrogram").setLevel(_logging.WARNING)
     _logging.getLogger("pyrogram.dispatcher").setLevel(_logging.ERROR)
@@ -108,32 +145,31 @@ async def _run() -> None:
 
     # ── Core services ──────────────────────────────────────────────────
     db = Database(config.database_url)
-    state = StateStore(config.redis_url)
+    state = StateStore(max_queue_size=config.max_queue_size)
     storage = JobStorage(config)
 
     try:
         await db.connect()
     except Exception as exc:
         log.error("db_connect_failed", extra={"error": str(exc)})
-        # Continue without DB? No – without DB nothing works. Exit so Render
-        # restarts us rather than hanging unhealthy.
         health.stop()
         sys.exit(3)
 
-    # Redis is a soft dependency: unavailable is logged (with the real,
-    # credential-safe reason) and a background task keeps retrying with
-    # backoff until Redis returns. The bot and health server start regardless.
-    await state.connect()  # never raises; tolerated if unavailable
+    # No Redis – StateStore is in-process, always available.
+    await state.connect()
 
-    # Clean stale dirs + recover interrupted/orphaned jobs.
+    # Clean stale dirs + recover interrupted/orphaned jobs (PostgreSQL source of truth).
     await startup_cleanup(db, state, storage, config.job_timeout)
     await state.reset_active_counters()
 
     jobs = JobManager(state, db, config)
-    rate_limiter = RateLimiter(state, config)
+    rate_limiter = RateLimiter(state, config, db)
 
     # ── Pyrogram client (proper session storage — not JobStorage) ──────
     app = build_pyrogram_client(config)
+    # Patch dispatcher before any handler registration
+    _patch_dispatcher_for_sync_registration(app)
+
     attach_app_services(
         app, jobs=jobs, storage=storage, state=state, db=db, config=config,
     )
@@ -146,16 +182,21 @@ async def _run() -> None:
     text_input.register(app, ctx)
     callbacks.register(app, ctx)
 
-    # Lightweight confirmation that handlers are wired (visible in logs even without messages).
+    # Reliable handler count – works both before and after loop starts
+    # because of the sync patch above. Yield once to ensure any remaining
+    # async registrations (if patch missed) are flushed.
     try:
+        await asyncio.sleep(0.05)
         group_count = len(getattr(app.dispatcher, "groups", {}))
         handler_count = sum(len(v) for v in getattr(app.dispatcher, "groups", {}).values())
         log.info("handlers_registered", extra={"groups": group_count, "handlers": handler_count})
+        if handler_count == 0:
+            # Fallback: count via direct inspection of module registrations
+            log.warning("handlers_registered_zero", extra={"groups": group_count, "handlers": handler_count})
     except Exception:
         log.info("handlers_registered")
 
     # Debug-safe raw update tracer (records ONLY metadata, never message text / secrets).
-    # Runs for every Telegram update; helps audit UPDATE → HANDLER path.
     from pyrogram.handlers import RawUpdateHandler
 
     async def _debug_update(_client, update, _users, _chats):
@@ -163,7 +204,6 @@ async def _run() -> None:
             utype = type(update).__name__
             uid = None
             cid = None
-            # Extract safe identifiers only (no content).
             if hasattr(update, "message") and update.message:
                 m = update.message
                 if getattr(m, "from_user", None):
@@ -174,7 +214,6 @@ async def _run() -> None:
                 uid = update.from_user.id
             elif hasattr(update, "user_id"):
                 uid = update.user_id
-            # Callback specific
             if "Callback" in utype or "callback" in utype.lower():
                 if hasattr(update, "from_user") and update.from_user:
                     uid = update.from_user.id
@@ -182,23 +221,14 @@ async def _run() -> None:
                     cid = update.message.chat.id
             log.info(
                 "telegram_update_received",
-                extra={
-                    "update_type": utype,
-                    "user_id": uid,
-                    "chat_id": cid,
-                    # handler name is not known at raw level; will be in handler entry logs
-                },
+                extra={"update_type": utype, "user_id": uid, "chat_id": cid},
             )
         except Exception:
-            pass  # never let debug tracer break the pipeline
+            pass
 
     app.add_handler(RawUpdateHandler(_debug_update), group=-999)
 
-    # Global error handler so exceptions inside user handlers become visible
-    # (Pyrogram catches and we surface them).
     async def _on_error(client, update, users, chats):
-        # This is invoked by dispatcher on handler exceptions in some paths.
-        # We log the update metadata + traceback.
         try:
             utype = type(update).__name__ if update is not None else "unknown"
             uid = getattr(getattr(update, "from_user", None), "id", None) if update else None
@@ -207,17 +237,10 @@ async def _run() -> None:
                 ch = getattr(update.message, "chat", None)
                 if ch:
                     cid = ch.id
-            log.error("handler_exception_surface", extra={
-                "update_type": utype,
-                "user_id": uid,
-                "chat_id": cid,
-            }, exc_info=True)
+            log.error("handler_exception_surface", extra={"update_type": utype, "user_id": uid, "chat_id": cid}, exc_info=True)
         except Exception:
             log.error("handler_exception_surface", exc_info=True)
 
-    # Attach as a very low priority raw so it can observe but not consume normal flow.
-    # (In Pyrogram the primary mechanism is that uncaught exceptions are already logged
-    # at ERROR by dispatcher.handler_worker when level allows.)
     try:
         app.add_handler(RawUpdateHandler(_on_error), group=999)
     except Exception:
@@ -245,21 +268,16 @@ async def _run() -> None:
         log.info("bot_started", extra={"username": me.username})
 
         processor.start()
+        log.info("processor_started", extra={"consumers": len(processor._consumers)})
         health.set_healthy(True)
 
-        # Wait until a stop signal is received. `idle()` keeps Pyrogram alive.
         await idle()
     except RPCError as exc:
         log.error("telegram_start_failed", extra={"error": str(exc)})
     except Exception as exc:
-        # Log the real exception type/message (credential-safe) AND the full
-        # traceback so a startup failure is never silently swallowed.
         log.error(
             "fatal_startup_error",
-            extra={
-                "error_type": type(exc).__name__,
-                "error": mask_credentials(str(exc)),
-            },
+            extra={"error_type": type(exc).__name__, "error": mask_credentials(str(exc))},
             exc_info=True,
         )
     finally:

@@ -1,7 +1,8 @@
 # Render Blueprint for the Telegram File Renamer Bot.
 # Deploys as a Web Service so Render provides an HTTPS URL and can health-check
-# the process on the free tier. PostgreSQL + Key Value (Redis) are provisioned
-# automatically.
+# the process on the free tier. PostgreSQL is provisioned automatically.
+# No Redis – PostgreSQL is the sole persistent store; queue/counters are
+# bounded in-process structures.
 services:
   - type: web
     name: file-renamer-bot
@@ -28,16 +29,6 @@ services:
         fromDatabase:
           name: file-renamer-db
           property: connectionString
-      # REDIS_URL must use the Render Key Value INTERNAL connection URL.
-      # `fromService` (type: kv) + `connectionString` injects the private,
-      # internal connection string used inside the Render private network.
-      # Do NOT use the public/external Key Value URL from the web service
-      # dashboard when the internal URL is available. Never hardcode it.
-      - key: REDIS_URL
-        fromService:
-          type: kv
-          name: file-renamer-redis
-          property: connectionString
       - key: MAX_FILE_SIZE_MB
         value: "25"
       - key: MAX_GLOBAL_ACTIVE_JOBS
@@ -54,12 +45,6 @@ services:
       # Optional start video (Telegram file_id or public URL).
       - key: START_VIDEO_URL
         sync: false
-
-  - type: kv
-    name: file-renamer-redis
-    plan: free
-    maxmemoryPolicy: allkeys-lru
-    ipAllowList: []
 
 databases:
   - name: file-renamer-db

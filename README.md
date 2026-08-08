@@ -1,37 +1,24 @@
 # 🎬 File Renamer Bot
 
-A production-ready **Telegram File Renamer Bot** built with [Pyrogram](https://docs.pyrogram.org/),
-async PostgreSQL (`asyncpg`) and Redis. Designed from the ground up for a
-**Render free web service (~512 MB RAM)**: low memory, streaming file I/O,
-bounded concurrency and full crash recovery.
+A production-ready **Telegram File Renamer Bot** built with [Pyrogram](https://docs.pyrogram.org) and async PostgreSQL (`asyncpg`). Designed from the ground up for a **Render free web service (~512 MB RAM)**: low memory, streaming file I/O, bounded concurrency and full crash recovery. **No Redis.**
 
-It renames **ordinary single files only** — text, code, config and
-document-like files (`.txt`, `.py`, `.js`, `.json`, `.csv`, `.md`, `.html`,
-`.yaml`, …). It **never** accepts photos, videos, audio or archives.
+It renames **ordinary single files only** — text, code, config and document-like files (`.txt`, `.py`, `.js`, `.json`, `.csv`, `.md`, `.html`, `.yaml`, …). It **never** accepts photos, videos, audio or archives.
 
 ---
 
 ## ✨ Features
 
-- ✅ **Normal rename** that always preserves the original extension
-  (`test.py` + `hello.txt` → `hello.py`)
+- ✅ **Normal rename** that always preserves the original extension (`test.py` + `hello.txt` → `hello.py`)
 - 🔄 **Extension change** as a separate, validated operation
-- 📦 **Batch mode** for multiple files (prefix, suffix, find/replace,
-  numbering with zero padding, whitespace cleanup, case conversion)
-- 💾 **PostgreSQL** persistence: users, jobs, history, settings, admin config
-- 🧠 **Redis** for the queue, rate limits, locks, active-job counters and
-  short-lived state (never permanent, never stores file bytes)
-- 🧵 **Real background worker** with a bounded queue and concurrency caps
-- 🚦 **Rate limiting** per user, per action
-- 📜 **Paginated history** and an **admin panel** (users / jobs / failed /
-  stats) with ownership and authorization checks on every callback
-- 🧹 **Crash recovery**: stale jobs are detected on restart, temp directories
-  wiped, interrupted jobs marked failed
-- 🩺 **Minimal `/health` HTTP server** (stdlib only) for Render / UptimeRobot —
-  returns plain text `OK` with HTTP 200 and is independent of Telegram,
-  PostgreSQL, Redis and the workers (binds `0.0.0.0:$PORT`)
-- 🛡️ **Memory-safe**: files are streamed to disk; never `read()` into RAM,
-  no `BytesIO`, bounded worker count, retries with backoff
+- 📦 **Batch mode** for multiple files (prefix, suffix, find/replace, numbering with zero padding, whitespace cleanup, case conversion)
+- 💾 **PostgreSQL** persistence: users, jobs, history, settings, admin config — the sole source of truth
+- 🧵 **Bounded in-process queue** (`asyncio` deque + `Condition`, capacity `MAX_QUEUE_SIZE`) and bounded worker pool
+- 🚦 **Rate limiting** per user, per action (in-memory fixed-window, bounded, no Redis)
+- 🔒 **In-process locks & deduplication** with TTL (no Redis)
+- 📜 **Paginated history** and an **admin panel** (users / jobs / failed / stats) with ownership and authorization checks on every callback
+- 🧹 **Crash recovery**: stale jobs detected on restart, temp directories wiped, interrupted jobs marked `FAILED`, `QUEUED` jobs re-enqueued from PostgreSQL into the bounded queue
+- 🩺 **Minimal `/health` HTTP server** (stdlib only) for Render / UptimeRobot — returns plain text `OK` with HTTP 200 and is dependency-free (binds `0.0.0.0:$PORT`)
+- 🛡️ **Memory-safe**: files are streamed to disk; never `read()` into RAM, no `BytesIO`, bounded worker count, retries with backoff
 
 ---
 
@@ -66,13 +53,13 @@ FILE-RENAME-BOT/
 │   ├── models.py               # JobStatus + idempotent DDL
 │   └── queries.py              # all SQL
 ├── services/
-│   ├── state.py                # Redis store (queue/locks/rate/cancel/state)
+│   ├── state.py                # in-process state (queue/locks/rate/cancel/user-state, bounded, no Redis)
 │   ├── jobs.py                 # admission control + slot management + cancel
 │   ├── storage.py              # temp dirs, disk checks, filesystem rename
-│   ├── cleanup.py              # stale-job + temp-dir recovery
-│   ├── rate_limit.py           # rate-limit facade
+│   ├── cleanup.py              # stale-job + temp-dir + queue recovery via PostgreSQL
+│   ├── rate_limit.py           # rate-limit facade (in-memory, bounded)
 │   └── health.py               # stdlib /health server
-├── workers/processor.py        # download → rename → upload → cleanup loop
+├── workers/processor.py        # download → rename → upload → cleanup loop (bounded queue consumer)
 ├── migrations/001_init.sql     # reference schema (also applied at startup)
 └── tests/test_core.py          # core unit tests (no Telegram/DB needed)
 ```
@@ -81,9 +68,7 @@ FILE-RENAME-BOT/
 
 ## ⚙️ Configuration
 
-All configuration comes from environment variables. The bot **refuses to
-start** with a clear error if a required variable is missing. Credentials are
-never logged.
+All configuration comes from environment variables. The bot **refuses to start** with a clear error if a required variable is missing. Credentials are never logged.
 
 ### Required
 
@@ -93,7 +78,6 @@ never logged.
 | `API_HASH`     | Telegram API hash                                        |
 | `BOT_TOKEN`    | Bot token from [@BotFather](https://t.me/BotFather)      |
 | `DATABASE_URL` | PostgreSQL connection string                             |
-| `REDIS_URL`    | Redis / Render Key Value connection string               |
 | `ADMIN_IDS`    | Comma-separated numeric Telegram admin IDs               |
 
 ### Optional (defaults tuned for 512 MB)
@@ -103,7 +87,7 @@ never logged.
 | `MAX_FILE_SIZE_MB`        | `25`    | Largest accepted file (hard cap 100 MB)  |
 | `MAX_GLOBAL_ACTIVE_JOBS`  | `2`     | Max concurrently processing jobs         |
 | `MAX_ACTIVE_JOBS_PER_USER`| `1`     | Max concurrent jobs per user             |
-| `MAX_QUEUE_SIZE`          | `20`    | Pending jobs before queue-full message   |
+| `MAX_QUEUE_SIZE`          | `20`    | Pending jobs before queue-full message (bounded in-memory queue capacity) |
 | `MAX_RETRIES`             | `3`     | Retries for transient errors             |
 | `JOB_TIMEOUT`             | `300`   | Seconds before a job is considered stale |
 | `HEALTH_HOST` / `HEALTH_PORT` | `0.0.0.0` / `8080` | Health server bind (Render sets `PORT`, used automatically) |
@@ -116,24 +100,18 @@ never logged.
 
 ## 🗄️ Database schema
 
-PostgreSQL is the source of truth. Tables are created idempotently at startup
-with `CREATE TABLE IF NOT EXISTS` and proper indexes. **Production tables are
-never dropped automatically.**
+PostgreSQL is the source of truth. Tables are created idempotently at startup with `CREATE TABLE IF NOT EXISTS` and proper indexes. **Production tables are never dropped automatically.**
 
 - `users(user_id, username, first_name, is_banned, is_admin, timestamps)`
 - `user_settings(user_id, case_mode, ws_mode, num_mode)`
-- `jobs(id uuid, user_id, batch_id, status, operation, original_name,
-  new_name, file_size, file_id, file_ref, chat_id, message ids, error,
-  attempts, timestamps)`
-- `history(user_id, job_id, operation, original_name, new_name, file_size,
-  status, created_at)`
+- `jobs(id uuid, user_id, batch_id, status, operation, original_name, new_name, file_size, file_id, file_ref, chat_id, message ids, error, attempts, timestamps)`
+- `history(user_id, job_id, operation, original_name, new_name, file_size, status, created_at)`
 - `admin_config(key, value)`
 - `schema_version(version)`
 
 See `migrations/001_init.sql` for the full DDL.
 
-Job states: `PENDING → QUEUED → DOWNLOADING → RENAMING → UPLOADING →
-CLEANING → COMPLETED` (or `FAILED` / `CANCELLED`).
+Job states: `PENDING → QUEUED → DOWNLOADING → RENAMING → UPLOADING → CLEANING → COMPLETED` (or `FAILED` / `CANCELLED`).
 
 ---
 
@@ -161,9 +139,7 @@ python tests/test_core.py
 python -m pytest tests/ -q
 ```
 
-The health server listens on `http://0.0.0.0:${PORT}/health` (Render injects
-`PORT`; locally it defaults to `8080`). It returns a plain `200 OK` / `OK`
-body and performs **no** dependency checks so it stays extremely cheap.
+The health server listens on `http://0.0.0.0:${PORT}/health` (Render injects `PORT`; locally it defaults to `8080`). It returns a plain `200 OK` / `OK` body and performs **no** dependency checks so it stays extremely cheap.
 
 ---
 
@@ -176,23 +152,17 @@ body and performs **no** dependency checks so it stays extremely cheap.
 3. Render reads `render.yaml` and creates:
    - a **Web Service** (`file-renamer-bot`, Docker, free plan)
    - a **PostgreSQL** database (`file-renamer-db`, free)
-   - a **Key Value / Redis** (`file-renamer-redis`, free)
-4. Set the secret env vars when prompted: `API_ID`, `API_HASH`,
-   `BOT_TOKEN`, `ADMIN_IDS`. (Optional `START_VIDEO_URL`.)
+4. Set the secret env vars when prompted: `API_ID`, `API_HASH`, `BOT_TOKEN`, `ADMIN_IDS`. (Optional `START_VIDEO_URL`.)
 5. Deploy. Render health-checks `/health` automatically.
 
 ### Option B — Manual
 
-1. Create a free PostgreSQL and a free Key Value (Redis) in Render.
-2. Create a **Web Service** pointing at the repo, using the **Docker**
-   runtime (or the Python starter with `pip install -r requirements.txt`
-   and start command `python main.py`).
-3. Add the environment variables above, wiring `DATABASE_URL` and
-   `REDIS_URL` from the created datastores.
+1. Create a free PostgreSQL in Render.
+2. Create a **Web Service** pointing at the repo, using the **Docker** runtime (or the Python starter with `pip install -r requirements.txt` and start command `python main.py`).
+3. Add the environment variables above, wiring `DATABASE_URL` from the created datastore.
 4. Set the health check path to `/health`.
 
-No persistent disk is required. All temporary files live under `/tmp` and are
-deleted after each job (and wiped on startup).
+No persistent disk is required. All temporary files live under `/tmp` and are deleted after each job (and wiped on startup). No Redis instance is needed.
 
 ---
 
@@ -205,14 +175,14 @@ Telegram update
  Handlers (commands / files / text / callbacks)
       │   validate size+type BEFORE download · rate limit · admission check
       ▼
- PostgreSQL  ◄── create job (PENDING) ──►  Redis user state
+ PostgreSQL  ◄── create job (PENDING) ──►  In-process user state (dict + TTL, bounded)
       │
       ▼ (user supplies new name)
- set_job_plan (QUEUED)  ──►  Redis work queue
+ set_job_plan (QUEUED)  ──►  Bounded in-process queue (asyncio deque + Condition, capacity 20)
                                   │
                                   ▼
-                     JobProcessor (single consumer loop)
-                                  │  acquire global + per-user slots
+                     JobProcessor (bounded consumer pool, size = MAX_GLOBAL_ACTIVE_JOBS)
+                                  │  acquire global + per-user slots (Semaphore) + PG counts
                                   ▼
                      DOWNLOAD (streamed to /tmp/.../<job>/)
                                   ▼
@@ -225,22 +195,14 @@ Telegram update
                      CLEANUP (rm -rf job dir) in finally
                                   ▼
                      mark COMPLETED/FAILED/CANCELLED + history
+       ▲                                  │
+       └─────── reconciler (every 30s) ◄──┘  re-enqueues QUEUED jobs from PostgreSQL if queue lost (crash recovery)
 ```
 
-- **Memory:** Pyrogram streams downloads/uploads to/from a path; the bot never
-  holds a whole file in RAM. The worker pool is bounded
-  (`MAX_GLOBAL_ACTIVE_JOBS=2`, per-user `1`) and the asyncpg/Redis pools are
-  small.
-- **PostgreSQL** is durable state (jobs, users, history). **Redis** is
-  ephemeral (queue, counters, locks, cancellation tokens). If Redis is wiped,
-  the bot stays correct: admission falls back to DB counts, and active jobs
-  are recoverable.
-- **Crash safety:** every job runs in a `try/finally`; unexpected exceptions
-  are recorded, not propagated. On startup, `cleanup.py` removes stale temp
-  directories and marks jobs stuck in active states as `FAILED`.
-- **Retries:** only transient errors (network, timeout, `FloodWait`) are
-  retried up to `MAX_RETRIES` with exponential backoff. Invalid files,
-  unsupported types, bad names and cancellations fail immediately.
+- **Memory:** Pyrogram streams downloads/uploads to/from a path; the bot never holds a whole file in RAM. The worker pool is bounded (`MAX_GLOBAL_ACTIVE_JOBS=2`, per-user `1`), queue capacity is bounded (`MAX_QUEUE_SIZE=20`), and the asyncpg pool is small (1–5). No `BytesIO`.
+- **PostgreSQL** is durable state (jobs, users, history, settings). **In-process structures** are ephemeral (queue, counters, locks, cancellation tokens, rate limits) but bounded and repopulated from PG on restart. If the process restarts, `startup_cleanup` wipes stale temp dirs, marks `DOWNLOADING/UPLOADING` jobs as `FAILED`, and re-enqueues `QUEUED` jobs into the bounded queue. The reconciler continuously ensures `QUEUED` rows missing from the queue are retried until the queue is full.
+- **Crash safety:** every job runs in a `try/finally`; unexpected exceptions are recorded, not propagated. On startup, `cleanup.py` removes stale temp directories and marks jobs stuck in active states as `FAILED`.
+- **Retries:** only transient errors (network, timeout, `FloodWait`) are retried up to `MAX_RETRIES` with exponential backoff. Invalid files, unsupported types, bad names and cancellations fail immediately.
 
 ---
 
@@ -260,23 +222,21 @@ Core unit tests in `tests/test_core.py` cover:
 - [x] Sequential numbering with zero padding
 - [x] Path-traversal / control-character sanitisation
 
-Runtime / integration behaviors wired and exercised by the running system:
-cancel, close, two simultaneous users (global slots), same user submitting
-multiple files (per-user slot + queue), worker failure isolation, DB
-reconnect, Redis unavailable (graceful degradation), Render restart / stale
-job recovery, pagination, rate limiting and malformed callbacks.
+Additional regression tests:
+
+- [x] `test_pyrogram_wiring.py` – Pyrogram session storage not overwritten, handler registration, `/start` without Redis/StateStore, bounded queue, in-memory state
+- [x] `test_health.py` – `/health` returns 200 OK without DB/Redis/workers
+
+Runtime / integration behaviors wired and exercised: cancel, close, two simultaneous users (global slots), same user submitting multiple files (per-user slot + queue), worker failure isolation, DB reconnect, Render restart / stale job recovery, pagination, rate limiting and malformed callbacks — all without Redis, using bounded in-memory structures + PostgreSQL.
 
 ---
 
 ## 🔒 Safety notes
 
-- Only ordinary **documents** are processed. Photos/videos/audio/animations
-  sent compressed are rejected by Telegram media type before any download.
+- Only ordinary **documents** are processed. Photos/videos/audio/animations sent compressed are rejected by Telegram media type before any download.
 - Extension change cannot turn a text file into a media/archive filename.
-- Filenames are sanitised (no path separators, control chars, reserved names)
-  and each job runs inside a UUID directory that cannot escape the temp root.
-- Every admin callback re-checks `ADMIN_IDS`; every job action verifies
-  ownership.
+- Filenames are sanitised (no path separators, control chars, reserved names) and each job runs inside a UUID directory that cannot escape the temp root.
+- Every admin callback re-checks `ADMIN_IDS`; every job action verifies ownership.
 
 ## 📜 License
 

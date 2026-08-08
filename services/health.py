@@ -2,7 +2,7 @@
 Minimal HTTP health server (stdlib only – keeps RAM low).
 
 Runs in its own daemon thread so Telegram processing is never blocked. It is
-deliberately independent of Telegram, PostgreSQL, Redis and the workers: its
+deliberately independent of Telegram, PostgreSQL and the workers: its
 only job is to tell Render / UptimeRobot that the web process is alive.
 
   GET /health  -> 200 "OK"
