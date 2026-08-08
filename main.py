@@ -11,7 +11,6 @@ import asyncio
 import os
 import signal
 import sys
-from collections import OrderedDict
 
 from pyrogram import Client, idle
 from pyrogram.errors import RPCError
@@ -87,44 +86,6 @@ def attach_app_services(app: Client, *, jobs, storage: JobStorage, state,
     app.config = config  # type: ignore[attr-defined]
 
 
-def _patch_dispatcher_for_sync_registration(app: Client) -> None:
-    """
-    Patch Dispatcher.add_handler to be synchronous before start().
-
-    Pyrogram's Dispatcher.add_handler schedules an async task via
-    loop.create_task, so immediate inspection of app.dispatcher.groups
-    shows 0 handlers. This patch makes add_handler synchronous when
-    locks_list is empty (i.e. before Dispatcher.start()), so
-    handlers_registered logging and tests see the real count.
-    """
-    try:
-        disp = app.dispatcher
-        orig = disp.add_handler
-
-        def sync_add_handler(handler, group: int):
-            # If dispatcher hasn't started yet (no locks), add synchronously
-            if not getattr(disp, "locks_list", None):
-                # empty list/falsy -> synchronous
-                if group not in disp.groups:
-                    disp.groups[group] = []
-                    disp.groups = OrderedDict(sorted(disp.groups.items()))
-                disp.groups[group].append(handler)
-                return
-            if len(disp.locks_list) == 0:
-                if group not in disp.groups:
-                    disp.groups[group] = []
-                    disp.groups = OrderedDict(sorted(disp.groups.items()))
-                disp.groups[group].append(handler)
-                return
-            return orig(handler, group)
-
-        # Only patch if not already patched
-        if getattr(sync_add_handler, "_patched", False) is not True:
-            disp.add_handler = sync_add_handler  # type: ignore
-    except Exception:
-        pass
-
-
 async def _run() -> None:
     try:
         config = get_config()
@@ -167,8 +128,6 @@ async def _run() -> None:
 
     # ── Pyrogram client (proper session storage — not JobStorage) ──────
     app = build_pyrogram_client(config)
-    # Patch dispatcher before any handler registration
-    _patch_dispatcher_for_sync_registration(app)
 
     attach_app_services(
         app, jobs=jobs, storage=storage, state=state, db=db, config=config,
@@ -177,24 +136,13 @@ async def _run() -> None:
     ctx = HandlerContext(app, db, state, rate_limiter, config)
 
     # Register handlers explicitly (deterministic order, no plugin magic).
+    # Pyrogram's Dispatcher.add_handler is async via loop.create_task, so
+    # immediate inspection would show 0. A short yield makes the count
+    # reliable without patching private internals.
     commands.register(app, ctx)
     files.register(app, ctx)
     text_input.register(app, ctx)
     callbacks.register(app, ctx)
-
-    # Reliable handler count – works both before and after loop starts
-    # because of the sync patch above. Yield once to ensure any remaining
-    # async registrations (if patch missed) are flushed.
-    try:
-        await asyncio.sleep(0.05)
-        group_count = len(getattr(app.dispatcher, "groups", {}))
-        handler_count = sum(len(v) for v in getattr(app.dispatcher, "groups", {}).values())
-        log.info("handlers_registered", extra={"groups": group_count, "handlers": handler_count})
-        if handler_count == 0:
-            # Fallback: count via direct inspection of module registrations
-            log.warning("handlers_registered_zero", extra={"groups": group_count, "handlers": handler_count})
-    except Exception:
-        log.info("handlers_registered")
 
     # Debug-safe raw update tracer (records ONLY metadata, never message text / secrets).
     from pyrogram.handlers import RawUpdateHandler
@@ -245,6 +193,19 @@ async def _run() -> None:
         app.add_handler(RawUpdateHandler(_on_error), group=999)
     except Exception:
         pass
+
+    # Yield to let pending add_handler tasks complete, then log reliable count.
+    # This uses public API (dispatcher.groups) after an event-loop tick, without
+    # mutating private Dispatcher internals.
+    try:
+        await asyncio.sleep(0.1)
+        group_count = len(getattr(app.dispatcher, "groups", {}))
+        handler_count = sum(len(v) for v in getattr(app.dispatcher, "groups", {}).values())
+        log.info("handlers_registered", extra={"groups": group_count, "handlers": handler_count})
+        if handler_count == 0:
+            log.warning("handlers_registered_zero", extra={"groups": group_count, "handlers": handler_count})
+    except Exception:
+        log.info("handlers_registered")
 
     # JobStorage is passed explicitly to the worker — never via Client.storage.
     processor = JobProcessor(app, db, state, jobs, storage, config)
