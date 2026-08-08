@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
-from typing import Optional
 
 from pyrogram import Client, idle
 from pyrogram.errors import RPCError
@@ -62,8 +61,8 @@ async def _run() -> None:
 
     await state.connect()  # tolerated if unavailable
 
-    # Clean stale dirs + recover interrupted jobs.
-    await startup_cleanup(db, storage, config.job_timeout)
+    # Clean stale dirs + recover interrupted/orphaned jobs.
+    await startup_cleanup(db, state, storage, config.job_timeout)
     await state.reset_active_counters()
 
     jobs = JobManager(state, db, config)
@@ -76,11 +75,16 @@ async def _run() -> None:
         api_hash=config.api_hash,
         bot_token=config.bot_token,
         in_memory=True,
-        workers=8,           # bounded – low memory
-        max_concurrent_transmissions=2,
+        workers=8,           # bounded update handlers – low memory
+        max_concurrent_transmissions=config.max_global_active_jobs,
         plugins=dict(enabled=False),
         workdir="/tmp",
+        parse_mode="html",
+        sleep_threshold=60,
     )
+    # Small in-memory cache for the start video file_id (avoids re-downloading
+    # the welcome video on every /start). Never stores user files.
+    app.start_video_file_id = None  # type: ignore[attr-defined]
     # Expose services to handlers via the app object.
     app.job_manager = jobs          # type: ignore[attr-defined]
     app.storage = storage           # type: ignore[attr-defined]

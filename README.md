@@ -27,7 +27,9 @@ document-like files (`.txt`, `.py`, `.js`, `.json`, `.csv`, `.md`, `.html`,
   stats) with ownership and authorization checks on every callback
 - 🧹 **Crash recovery**: stale jobs are detected on restart, temp directories
   wiped, interrupted jobs marked failed
-- 🩺 **Minimal `/health` HTTP server** (stdlib only) for Render health checks
+- 🩺 **Minimal `/health` HTTP server** (stdlib only) for Render / UptimeRobot —
+  returns plain text `OK` with HTTP 200 and is independent of Telegram,
+  PostgreSQL, Redis and the workers (binds `0.0.0.0:$PORT`)
 - 🛡️ **Memory-safe**: files are streamed to disk; never `read()` into RAM,
   no `BytesIO`, bounded worker count, retries with backoff
 
@@ -104,9 +106,9 @@ never logged.
 | `MAX_QUEUE_SIZE`          | `20`    | Pending jobs before queue-full message   |
 | `MAX_RETRIES`             | `3`     | Retries for transient errors             |
 | `JOB_TIMEOUT`             | `300`   | Seconds before a job is considered stale |
-| `HEALTH_HOST` / `HEALTH_PORT` | `0.0.0.0` / `8080` | Health server bind            |
+| `HEALTH_HOST` / `HEALTH_PORT` | `0.0.0.0` / `8080` | Health server bind (Render sets `PORT`, used automatically) |
 | `TEMP_DIR`                | `/tmp/file-renamer` | Per-job temp directory root     |
-| `START_VIDEO_URL`         | _empty_ | Optional start video (file_id/URL)       |
+| `START_VIDEO_URL`         | `https://files.catbox.moe/5qz09e.mp4` | Start video (overridable) |
 | `RATE_LIMIT`              | `60`    | Rate-limit window (seconds)              |
 | `RATE_LIMIT_*`            | see code| Per-action overrides                     |
 
@@ -159,7 +161,9 @@ python tests/test_core.py
 python -m pytest tests/ -q
 ```
 
-The health server listens on `http://0.0.0.0:8080/health`.
+The health server listens on `http://0.0.0.0:${PORT}/health` (Render injects
+`PORT`; locally it defaults to `8080`). It returns a plain `200 OK` / `OK`
+body and performs **no** dependency checks so it stays extremely cheap.
 
 ---
 

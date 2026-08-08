@@ -43,6 +43,8 @@ class JobManager:
         self._user_lock = asyncio.Lock()
         # Track active task objects so they can be cancelled on shutdown.
         self._tasks: set[asyncio.Task] = set()
+        # Fire-and-forget background tasks (e.g. Redis counter decrement).
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def _user_semaphore(self, user_id: int) -> asyncio.Semaphore:
         async with self._user_lock:
@@ -63,8 +65,10 @@ class JobManager:
             return AdmissionResult(False, "user_busy", user_active)
 
         # Also consult the DB as a safety net in case Redis lost state.
+        # PENDING jobs (files received, awaiting instruction) do not consume a
+        # processing slot, so batch accumulation is allowed.
         try:
-            db_active = await queries.count_user_active_jobs(self._db, user_id)
+            db_active = await queries.count_user_processing_jobs(self._db, user_id)
             if db_active >= self._config.max_active_jobs_per_user:
                 return AdmissionResult(False, "user_busy", db_active)
         except Exception as exc:
@@ -89,10 +93,13 @@ class JobManager:
         sem = self._user_slots.get(user_id)
         if sem is not None:
             sem.release()
-        # Decrement Redis counter best-effort.
+        # Decrement Redis counter best-effort (tracked so it isn't GC'd and
+        # exceptions can't crash the worker).
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._state.decr_active(user_id))
+            task = loop.create_task(self._state.decr_active(user_id))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
         except RuntimeError:
             pass
 
@@ -133,6 +140,16 @@ class JobManager:
             return "active"
 
         return "not_found"
+
+    async def cancel_user_jobs(self, user_id: int) -> int:
+        """Cancel all non-terminal jobs belonging to a user. Returns count."""
+        active = await queries.list_user_active_jobs(self._db, user_id)
+        count = 0
+        for job in active:
+            result = await self.cancel_job(str(job["id"]), user_id)
+            if result != "not_found":
+                count += 1
+        return count
 
     async def shutdown(self) -> None:
         for task in list(self._tasks):

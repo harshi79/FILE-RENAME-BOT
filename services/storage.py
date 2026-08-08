@@ -7,7 +7,6 @@ download and the directory is always removed in a finally block.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import uuid
 from pathlib import Path
@@ -62,7 +61,16 @@ class JobStorage:
         if not path.is_file():
             return False, 0
         actual = path.stat().st_size
-        return actual > 0 and actual <= max(expected_size, self._config.max_file_size) * 1.1, actual
+        if actual <= 0:
+            return False, actual
+        # If we know the expected size, allow a tiny tolerance; otherwise just
+        # enforce the global maximum.
+        if expected_size and expected_size > 0:
+            if actual > self._config.max_file_size:
+                return False, actual
+            # Tolerate small differences (Telegram reports approximate sizes).
+            return abs(actual - expected_size) <= max(1024, int(expected_size * 0.05)), actual
+        return actual <= self._config.max_file_size, actual
 
     def perform_filesystem_rename(self, src: Path, new_name: str) -> Path:
         """

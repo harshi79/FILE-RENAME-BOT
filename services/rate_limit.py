@@ -7,7 +7,6 @@ config and can be overridden per action.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
 
 from config import Config
 from services.state import StateStore

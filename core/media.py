@@ -7,7 +7,7 @@ be unit-tested without a live Telegram connection.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 from core.validation import classify_telegram_media
 

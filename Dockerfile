@@ -27,10 +27,13 @@ RUN useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app /tmp/file-renamer
 USER appuser
 
-EXPOSE 8080
+# Render injects $PORT at runtime (default 10000). The app reads $PORT.
+ENV PORT=10000
+EXPOSE 10000
 
-# Render provides a health check against /health.
+# Render provides an external health check against /health; this container-level
+# check uses the same port for local verification.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+    CMD curl -fsS http://127.0.0.1:${PORT}/health || exit 1
 
 CMD ["python", "main.py"]

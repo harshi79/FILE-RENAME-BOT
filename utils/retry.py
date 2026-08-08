@@ -20,11 +20,6 @@ PERMANENT_ERRORS: Tuple[Type[BaseException], ...] = (
     PermissionError,
 )
 
-# Telegram errors that indicate a permanent problem for this operation.
-PERMANENT_RPC = (
-    pyrogram.errors.VolumeLocNotFound,
-)
-
 
 class CancellationError(Exception):
     """Raised when a job has been cancelled."""

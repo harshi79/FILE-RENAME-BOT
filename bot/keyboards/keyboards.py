@@ -5,7 +5,7 @@ Callback data is kept short (<64 bytes) and prefixed so handlers can route it.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -117,3 +117,21 @@ def pagination_keyboard(prefix: str, page: int, total_pages: int) -> InlineKeybo
     rows.append(nav)
     rows.append([InlineKeyboardButton("⬅️ ʙᴀᴄᴋ", callback_data="main")])
     return InlineKeyboardMarkup(rows)
+
+
+def users_admin_keyboard(rows, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Per-user ban/unban toggle plus pagination."""
+    buttons: List[List[InlineKeyboardButton]] = []
+    for r in rows:
+        uid = r["user_id"]
+        label = f"🚫 ban {uid}" if not r.get("is_banned") else f"✅ unban {uid}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"ban:{uid}")])
+    nav: List[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"adm:users:{page-1}"))
+    nav.append(InlineKeyboardButton(f"ᴘᴀɢᴇ {page}/{max(1,total_pages)}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"adm:users:{page+1}"))
+    buttons.append(nav)
+    buttons.append([InlineKeyboardButton("⬅️ ʙᴀᴄᴋ", callback_data="admin")])
+    return InlineKeyboardMarkup(buttons)

@@ -1,18 +1,21 @@
 """
-Job processor / worker.
+Job processor / worker pool.
 
-A single background consumer loop pulls job ids off the Redis queue. Each job
-acquires bounded concurrency slots, streams the file to a unique temp
-directory, renames on the filesystem, streams it back to Telegram, and always
-cleans up. Every failure is caught and recorded; a bad job never crashes the
-worker or the bot.
+A small, bounded pool of consumer coroutines pulls job ids off the Redis
+queue. Each job acquires global + per-user concurrency slots, streams the file
+to a unique temp directory, renames on the filesystem, streams it back to
+Telegram, and ALWAYS cleans up in finally. Every failure is caught and
+recorded; a bad job never crashes a consumer or the bot.
+
+A lightweight reconciler periodically re-enqueues QUEUED jobs that are absent
+from Redis (survives a Redis flush / brief outage).
 """
 from __future__ import annotations
 
 import asyncio
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import pyrogram
 from pyrogram.errors import RPCError, FloodWait
@@ -33,6 +36,10 @@ log = get_logger(__name__)
 
 # How often (in percent) progress messages are edited during transfer.
 PROGRESS_STEP = 15
+# Cap FloodWait sleeping so a single huge wait cannot wedge a consumer forever.
+MAX_FLOOD_WAIT = 60
+# Reconciler cadence – re-push orphan QUEUED jobs if Redis lost them.
+RECONCILE_INTERVAL = 30
 
 
 class JobProcessor:
@@ -51,28 +58,42 @@ class JobProcessor:
         self.jobs = jobs
         self.storage = storage
         self.config = config
-        self._task: Optional[asyncio.Task] = None
+        self._consumers: List[asyncio.Task] = []
+        self._reconciler: Optional[asyncio.Task] = None
         self._stopping = False
 
+    # ──────────────────────────────────────────────────────────────────
     def start(self) -> None:
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._run(), name="job-processor")
-            self.jobs.track_task(self._task)
+        n = max(1, min(self.config.max_global_active_jobs, 4))
+        for i in range(n):
+            t = asyncio.create_task(self._consume(i), name=f"job-consumer-{i}")
+            self.jobs.track_task(t)
+            self._consumers.append(t)
+        self._reconciler = asyncio.create_task(self._reconcile(), name="queue-reconciler")
+        self.jobs.track_task(self._reconciler)
+        log.info("processor_started", extra={"consumers": n})
 
     async def stop(self) -> None:
         self._stopping = True
-        if self._task:
-            self._task.cancel()
+        for t in list(self._consumers) + ([self._reconciler] if self._reconciler else []):
+            t.cancel()
+        for t in list(self._consumers):
             try:
-                await self._task
+                await t
             except (asyncio.CancelledError, Exception):
                 pass
+        if self._reconciler:
+            try:
+                await self._reconciler
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._consumers.clear()
+        self._reconciler = None
 
     # ──────────────────────────────────────────────────────────────────
     # Consumer loop
     # ──────────────────────────────────────────────────────────────────
-    async def _run(self) -> None:
-        log.info("processor_started")
+    async def _consume(self, idx: int) -> None:
         while not self._stopping:
             job_id = None
             try:
@@ -82,22 +103,45 @@ class JobProcessor:
                 await self._process_with_slots(job_id)
             except asyncio.CancelledError:
                 break
-            except Exception as exc:  # one bad job must not kill the loop
-                log.error("processor_loop_error", extra={"error": str(exc)})
+            except Exception as exc:  # one bad job must not kill the consumer
+                log.error("processor_loop_error", extra={"consumer": idx, "error": str(exc)})
                 if job_id:
                     try:
                         await self._mark_failed(job_id, f"internal error: {type(exc).__name__}")
-                        self.storage.cleanup_job(job_id)
                     except Exception:
                         pass
-                await asyncio.sleep(1)
-        log.info("processor_stopped")
+                    self.storage.cleanup_job(job_id)
+                await asyncio.sleep(0.5)
+
+    async def _reconcile(self) -> None:
+        while not self._stopping:
+            try:
+                await asyncio.sleep(RECONCILE_INTERVAL)
+                if self._stopping:
+                    break
+                queued = await queries.list_queued_jobs(self.db, limit=200)
+                for job in queued:
+                    jid = str(job["id"])
+                    # Skip jobs already being processed (have an active cancel/lock).
+                    if await self.state.is_cancelled(jid):
+                        continue
+                    # Best-effort: if queue length is 0 re-push; otherwise we
+                    # cannot cheaply know membership, so re-push and rely on the
+                    # terminal-state guard in _process_with_slots for dedup.
+                    if await self.state.queue_length() == 0:
+                        await self.state.enqueue_job(jid)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.warning("reconcile_error", extra={"error": str(exc)})
 
     async def _process_with_slots(self, job_id: str) -> None:
         job = await queries.get_job(self.db, job_id)
         if not job:
             return
-        if job["status"] in (JobStatus.CANCELLED.value, JobStatus.COMPLETED.value):
+        # Terminal-state guard: prevents duplicate processing after requeue.
+        if job["status"] in (JobStatus.CANCELLED.value, JobStatus.COMPLETED.value,
+                             JobStatus.FAILED.value):
             return
 
         user_id = int(job["user_id"])
@@ -136,10 +180,10 @@ class JobProcessor:
                 await self._fail(job_id, M.ERR_GENERIC, "missing file_id", user_id=user_id)
                 return
 
-            # 2) Download (streamed to disk by Pyrogram). We pass the job
-            #    DIRECTORY and let Pyrogram pick the filename inside it, then
-            #    resolve the actual path from the returned value. This avoids
-            #    path-handling differences across Pyrogram versions.
+            # 2) Download (streamed to disk by Pyrogram). Pass the job
+            #    DIRECTORY with a trailing separator; Pyrogram writes the file
+            #    inside it using its own name, which we then resolve. This is
+            #    the documented, version-stable path behaviour.
             await self._set_status(job_id, JobStatus.DOWNLOADING)
             await self._edit_status(chat_id, job, M.STATUS_DOWNLOADING.format(percent=0))
 
@@ -170,20 +214,7 @@ class JobProcessor:
             )
 
             # Resolve the actual file on disk.
-            dl_path: Optional[Path] = None
-            if downloaded:
-                candidate = Path(downloaded)
-                if candidate.is_file():
-                    dl_path = candidate
-                elif candidate.is_dir():
-                    files = [p for p in candidate.iterdir() if p.is_file()]
-                    if files:
-                        dl_path = files[0]
-            if dl_path is None:
-                # Fallback: look for the only file in the job directory.
-                files = [p for p in job_dir.iterdir() if p.is_file()] if job_dir.exists() else []
-                if len(files) == 1:
-                    dl_path = files[0]
+            dl_path = self._resolve_downloaded_file(job_dir, downloaded)
             if dl_path is None or not dl_path.is_file():
                 await self._fail(job_id, M.ERR_GENERIC, "download produced no file",
                                  user_id=user_id)
@@ -255,11 +286,12 @@ class JobProcessor:
             await self._delete_status(chat_id, job)
 
         except CancellationError:
-            await self._mark_cancelled(job_id, user_id=int(job["user_id"]), chat_id=chat_id, job=job)
+            await self._mark_cancelled(job_id, user_id=int(job["user_id"]),
+                                       chat_id=chat_id, job=job)
         except FloodWait as fw:
-            wait = int(getattr(fw, "value", 5))
+            wait = min(int(getattr(fw, "value", 5)), MAX_FLOOD_WAIT)
             log.warning("flood_wait", extra={"job": job_id, "wait": wait})
-            await self._fail(job_id, M.ERR_GENERIC, f"flood wait {wait}s",
+            await self._fail(job_id, M.ERR_GENERIC, "rate limited (retry later)",
                              user_id=int(job["user_id"]), chat_id=chat_id, job=job)
         except RPCError as exc:
             log.error("rpc_error", extra={"job": job_id, "error": str(exc)})
@@ -274,12 +306,34 @@ class JobProcessor:
             await self._fail(job_id, M.ERR_GENERIC, type(exc).__name__,
                              user_id=int(job["user_id"]), chat_id=chat_id, job=job)
 
+    @staticmethod
+    def _resolve_downloaded_file(job_dir: Path, downloaded: Optional[str]) -> Optional[Path]:
+        """Find the actual file Pyrogram produced inside the job directory."""
+        if downloaded:
+            candidate = Path(downloaded)
+            if candidate.is_file():
+                return candidate
+            if candidate.is_dir():
+                files = [p for p in candidate.iterdir() if p.is_file()]
+                if files:
+                    # Prefer the largest file (the actual download).
+                    return max(files, key=lambda p: p.stat().st_size)
+        if job_dir.exists():
+            files = [p for p in job_dir.iterdir() if p.is_file()]
+            if files:
+                return max(files, key=lambda p: p.stat().st_size)
+        return None
+
     # ──────────────────────────────────────────────────────────────────
     # Status / DB helpers
     # ──────────────────────────────────────────────────────────────────
     async def _set_status(self, job_id: str, status: JobStatus, **kw) -> None:
         try:
-            await queries.set_job_status(self.db, job_id, status, increment_attempts=(status == JobStatus.DOWNLOADING), **kw)
+            await queries.set_job_status(
+                self.db, job_id, status,
+                increment_attempts=(status == JobStatus.DOWNLOADING),
+                **kw,
+            )
         except Exception as exc:
             log.warning("status_update_failed", extra={"job": job_id, "error": str(exc)})
 
@@ -305,14 +359,17 @@ class JobProcessor:
                     *, user_id: int, chat_id: Optional[int] = None,
                     job: Optional[dict] = None) -> None:
         await self._mark_failed(job_id, internal_reason)
-        await queries.add_history(
-            self.db, user_id=user_id, job_id=job_id,
-            operation=(job or {}).get("operation", "rename"),
-            original_name=(job or {}).get("original_name", ""),
-            new_name=(job or {}).get("new_name", ""),
-            file_size=int((job or {}).get("file_size", 0) or 0),
-            status=JobStatus.FAILED.value,
-        )
+        try:
+            await queries.add_history(
+                self.db, user_id=user_id, job_id=job_id,
+                operation=(job or {}).get("operation", "rename"),
+                original_name=(job or {}).get("original_name", ""),
+                new_name=(job or {}).get("new_name", ""),
+                file_size=int((job or {}).get("file_size", 0) or 0),
+                status=JobStatus.FAILED.value,
+            )
+        except Exception as exc:
+            log.warning("fail_history_error", extra={"job": job_id, "error": str(exc)})
         if chat_id and job and job.get("status_msg_id"):
             try:
                 await self.app.edit_message_text(
@@ -331,14 +388,17 @@ class JobProcessor:
     async def _mark_cancelled(self, job_id: str, *, user_id: int, chat_id: int, job: dict) -> None:
         try:
             await queries.set_job_status(self.db, job_id, JobStatus.CANCELLED, error="cancelled")
-            await queries.add_history(
-                self.db, user_id=user_id, job_id=job_id,
-                operation=job.get("operation", "rename"),
-                original_name=job.get("original_name", ""),
-                new_name=job.get("new_name", ""),
-                file_size=int(job.get("file_size", 0) or 0),
-                status=JobStatus.CANCELLED.value,
-            )
+            try:
+                await queries.add_history(
+                    self.db, user_id=user_id, job_id=job_id,
+                    operation=job.get("operation", "rename"),
+                    original_name=job.get("original_name", ""),
+                    new_name=job.get("new_name", ""),
+                    file_size=int(job.get("file_size", 0) or 0),
+                    status=JobStatus.CANCELLED.value,
+                )
+            except Exception:
+                pass
             if job.get("status_msg_id"):
                 await self.app.edit_message_text(chat_id, job["status_msg_id"], M.JOB_CANCELLED)
         except Exception as exc:

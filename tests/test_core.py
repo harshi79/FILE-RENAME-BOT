@@ -150,5 +150,39 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(validate_extension_change(".txt"))
 
 
+class StoragePathTests(unittest.TestCase):
+    def test_path_traversal_blocked(self):
+        import tempfile
+        from services.storage import JobStorage, StorageError
+        import os, uuid
+        os.environ.setdefault("TEMP_DIR", tempfile.mkdtemp())
+        # Minimal config stub for storage.
+        class _Cfg:
+            temp_dir = __import__("pathlib").Path(tempfile.mkdtemp())
+            max_file_size = 25 * 1024 * 1024
+        s = JobStorage(_Cfg())
+        with self.assertRaises(StorageError):
+            s.job_dir("../etc")
+        with self.assertRaises(StorageError):
+            s.job_dir("not-a-uuid")
+        jid = str(uuid.uuid4())
+        d = s.create_job_dir(jid)
+        self.assertTrue(d.is_dir())
+        s.cleanup_job(jid)
+        self.assertFalse(d.exists())
+
+
+class FilenameSettingsTests(unittest.TestCase):
+    def test_apply_settings(self):
+        from core.filename import apply_settings_to_stem
+        self.assertEqual(
+            apply_settings_to_stem("hello   world", {"ws_mode": "on", "case_mode": "title"}),
+            "Hello World",
+        )
+        self.assertEqual(apply_settings_to_stem("HELLO", {"case_mode": "lower"}), "hello")
+        # none leaves unchanged
+        self.assertEqual(apply_settings_to_stem("HeLLo", {}), "HeLLo")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

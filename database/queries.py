@@ -6,15 +6,11 @@ One layer above the pool so handlers / workers never embed raw SQL.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from database.database import Database
 from database.models import JobStatus
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _row_to_dict(row) -> Dict[str, Any]:
@@ -210,6 +206,44 @@ async def count_user_active_jobs(db: Database, user_id: int) -> int:
         user_id, list(JobStatus.active_states()),
     )
     return int(row["c"]) if row else 0
+
+
+async def count_user_processing_jobs(db: Database, user_id: int) -> int:
+    """Jobs actually queued or processing (excludes PENDING batch items)."""
+    processing = [
+        JobStatus.QUEUED.value, JobStatus.DOWNLOADING.value,
+        JobStatus.RENAMING.value, JobStatus.UPLOADING.value,
+        JobStatus.CLEANING.value,
+    ]
+    row = await db.fetch_one(
+        "SELECT COUNT(*) AS c FROM jobs WHERE user_id = $1 AND status = ANY($2::text[])",
+        user_id, processing,
+    )
+    return int(row["c"]) if row else 0
+
+
+async def list_user_active_jobs(db: Database, user_id: int) -> List[Dict[str, Any]]:
+    rows = await db.fetch_all(
+        "SELECT * FROM jobs WHERE user_id = $1 AND status = ANY($2::text[]) ORDER BY created_at ASC",
+        user_id, list(JobStatus.active_states()),
+    )
+    return [_row_to_dict(r) for r in rows]
+
+
+async def list_failed_jobs(db: Database, offset: int, limit: int) -> List[Dict[str, Any]]:
+    rows = await db.fetch_all(
+        "SELECT * FROM jobs WHERE status = 'FAILED' ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT $1 OFFSET $2",
+        limit, offset,
+    )
+    return [_row_to_dict(r) for r in rows]
+
+
+async def list_queued_jobs(db: Database, limit: int = 200) -> List[Dict[str, Any]]:
+    rows = await db.fetch_all(
+        "SELECT * FROM jobs WHERE status = $1 ORDER BY created_at ASC LIMIT $2",
+        JobStatus.QUEUED.value, limit,
+    )
+    return [_row_to_dict(r) for r in rows]
 
 
 async def get_stale_jobs(db: Database, cutoff: datetime) -> List[Dict[str, Any]]:

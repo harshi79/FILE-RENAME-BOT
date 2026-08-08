@@ -157,13 +157,28 @@ def transform_whitespace(stem: str) -> str:
 
 
 def transform_case(stem: str, mode: str) -> str:
-    mode = (mode or "title").lower()
+    mode = (mode or "none").lower()
     if mode == "lower":
         return stem.lower()
     if mode == "upper":
         return stem.upper()
     if mode == "title":
         return stem.title()
+    return stem  # "none" / unknown -> unchanged
+
+
+def apply_settings_to_stem(stem: str, settings: dict) -> str:
+    """
+    Apply a user's persisted preferences (whitespace cleanup + case mode) to a
+    stem. Called for operations that aren't themselves case/whitespace actions.
+    """
+    if not settings:
+        return stem
+    if str(settings.get("ws_mode", "off")).lower() == "on":
+        stem = transform_whitespace(stem)
+    case_mode = str(settings.get("case_mode", "none")).lower()
+    if case_mode in {"lower", "upper", "title"}:
+        stem = transform_case(stem, case_mode)
     return stem
 
 

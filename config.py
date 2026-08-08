@@ -10,7 +10,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Optional, Set
+
+# Default welcome video shown by /start (can be overridden via START_VIDEO_URL).
+DEFAULT_START_VIDEO_URL = "https://files.catbox.moe/5qz09e.mp4"
 
 # Load a local .env file if present (safe no-op in production).
 try:
@@ -46,6 +49,20 @@ def _get_int(name: str, default: int) -> int:
         return value
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(f"{name} must be a positive integer, got: {raw!r}") from exc
+
+
+def _get_port(default: int = 8080) -> int:
+    """Render sets $PORT. HEALTH_PORT still overrides for local runs."""
+    raw = os.environ.get("HEALTH_PORT") or os.environ.get("PORT")
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        port = int(str(raw).strip())
+        if not (1 <= port <= 65535):
+            raise ValueError
+        return port
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"PORT must be an integer 1-65535, got: {raw!r}") from exc
 
 
 def _parse_admin_ids(raw: str) -> Set[int]:
@@ -170,8 +187,8 @@ def load_config() -> Config:
         admin_page_size=_get_int("ADMIN_PAGE_SIZE", 10),
         temp_dir=temp_dir,
         health_host=_get_env("HEALTH_HOST", "0.0.0.0"),
-        health_port=_get_int("HEALTH_PORT", 8080),
-        start_video_url=_get_env("START_VIDEO_URL", ""),
+        health_port=_get_port(8080),
+        start_video_url=_get_env("START_VIDEO_URL", DEFAULT_START_VIDEO_URL),
         rate_limit=RateLimitConfig.from_env(),
     )
 

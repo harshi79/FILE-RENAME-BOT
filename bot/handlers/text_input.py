@@ -86,6 +86,12 @@ def register(app: Client, ctx: HandlerContext) -> None:
             await ctx.state.clear_user_state(message.from_user.id)
             return
         plan = rn.plan_rename(original, raw)
+        # Apply the user's persisted whitespace/case preferences.
+        try:
+            settings = await queries.get_settings(ctx.db, message.from_user.id)
+            plan.new_name = rn.apply_settings_to_name(plan.new_name, settings)
+        except Exception:
+            pass
         await enqueue_single(message, job_id, plan, "rename")
 
     async def single_ext(message: Message, state: Dict, raw: str):
@@ -182,22 +188,22 @@ def register(app: Client, ctx: HandlerContext) -> None:
                 return
         await ctx.state.enqueue_job(job_id)
         await ctx.state.clear_user_state(message.from_user.id)
-
     async def enqueue_batch(message: Message, items: List[Dict],
                             plans: List[rn.RenamePlan], operation: str):
         user = message.from_user
-        queued = 0
         status = await message.reply(M.STATUS_QUEUED)
+        queued = 0
         for item, plan in zip(items, plans):
             job_id = item["job_id"]
+            # The job is QUEUED in Postgres regardless of Redis availability;
+            # the reconciler re-pushes it if Redis was temporarily unavailable.
             await queries.set_job_plan(
                 ctx.db, job_id, operation, plan.new_name, status_msg_id=status.id,
             )
-            if await ctx.state.enqueue_job(job_id):
-                queued += 1
+            await ctx.state.enqueue_job(job_id)
+            queued += 1
         await ctx.state.clear_user_state(user.id)
-        if queued:
-            try:
-                await status.edit_text(M.JOB_BATCH_DONE.format(ok=queued, total=len(items)))
-            except Exception:
-                pass
+        try:
+            await status.edit_text(M.JOB_BATCH_DONE.format(ok=queued, total=len(items)))
+        except Exception:
+            pass

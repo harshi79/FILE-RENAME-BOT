@@ -33,6 +33,14 @@ def _build(original_name: str, new_stem: str, new_ext: Optional[str] = None) -> 
     return fn.apply_stem(original_name, new_stem)
 
 
+def apply_settings_to_name(name: str, settings: dict) -> str:
+    """Apply persisted ws/case preferences to a final filename (keeps ext)."""
+    from core import filename as fn
+    stem, ext = fn.split_extension(name)
+    stem = fn.apply_settings_to_stem(stem, settings)
+    return fn.sanitise_filename(stem + ext)
+
+
 def plan_rename(original_name: str, user_input: str) -> RenamePlan:
     """Normal rename: user-supplied extension is ignored."""
     new_name = fn.apply_stem(original_name, user_input)

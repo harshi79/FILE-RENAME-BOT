@@ -38,8 +38,9 @@ services:
         value: "3"
       - key: JOB_TIMEOUT
         value: "300"
-      - key: HEALTH_PORT
-        value: "8080"
+      # Render injects $PORT automatically; the health server binds to it.
+      - key: HEALTH_HOST
+        value: "0.0.0.0"
       # Optional start video (Telegram file_id or public URL).
       - key: START_VIDEO_URL
         sync: false

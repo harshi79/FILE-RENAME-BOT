@@ -61,7 +61,11 @@ def register(app: Client, ctx: HandlerContext) -> None:
         if data.startswith("close:"):
             job_id = data.split(":", 1)[1]
             await _assert_owner(ctx, job_id, user_id)
-            await cb.message.delete()  # type: ignore[union-attr]
+            try:
+                if cb.message:
+                    await cb.message.delete()
+            except Exception:
+                pass
             await cb.answer()
             return
 
@@ -119,7 +123,7 @@ def register(app: Client, ctx: HandlerContext) -> None:
         # ── Batch actions ─────────────────────────────────────────────
         batch_map = {
             "b_rename": ("batch_rename", M.BATCH_RENAME_PROMPT.format(base="Episode", ext=".txt")),
-            "b_ext": ("batch_ext", M.EXTENSION_PROMPT.format(current="(batch)")),
+            "b_ext": ("batch_ext", "🔄 <b>ꜱᴇɴᴅ ᴛʜᴇ ɴᴇᴡ ᴇxᴛᴇɴsɪᴏɴ ꜰᴏʀ ᴀʟʟ ꜰɪʟᴇs</b>\nᴇxᴀᴍᴘʟᴇ: <code>.md</code>"),
             "b_prefix": ("batch_prefix", M.PREFIX_PROMPT),
             "b_suffix": ("batch_suffix", M.SUFFIX_PROMPT),
             "b_replace": ("batch_replace", M.ADVANCED_PROMPT_FIND),
@@ -159,8 +163,36 @@ def register(app: Client, ctx: HandlerContext) -> None:
             return
 
         if data == "b_cancel":
+            state = await ctx.state.get_user_state(user_id) or {}
+            items = state.get("items", [])
+            jm = getattr(app, "job_manager", None)
+            for item in items:
+                try:
+                    if jm is not None:
+                        await jm.cancel_job(item["job_id"], user_id)
+                    else:
+                        from database.models import JobStatus
+                        await queries.set_job_status(
+                            ctx.db, item["job_id"], JobStatus.CANCELLED, error="cancelled"
+                        )
+                except Exception:
+                    pass
             await ctx.state.clear_user_state(user_id)
             await cb.edit_message_text(M.STATE_CLEARED)
+            return
+
+        # Admin ban/unban toggle: "ban:<user_id>"
+        if data.startswith("ban:"):
+            if not ctx.config.is_admin(user_id):
+                await cb.answer(M.ERR_NOT_ADMIN, show_alert=True)
+                return
+            target = int(data.split(":", 1)[1])
+            u = await queries.get_user(ctx.db, target)
+            new_state = not bool(u and u.get("is_banned"))
+            await queries.set_banned(ctx.db, target, new_state)
+            await cb.answer(("🚫 banned" if new_state else "✅ unbanned"), show_alert=False)
+            # Refresh the users list.
+            await _admin_dispatch(cb, ctx, "adm:users:0")
             return
 
         # ── Settings / history / admin ────────────────────────────────
@@ -306,10 +338,13 @@ async def _admin_dispatch(cb: CallbackQuery, ctx: HandlerContext, data: str) -> 
         total = await queries.count_users(ctx.db)
         body = "👥 <b>ᴜsᴇʀs</b>\n\n"
         for r in rows:
-            body += f"• <code>{r['user_id']}</code> {r.get('first_name','')} {'🚫' if r.get('is_banned') else ''}\n"
+            name = (r.get("first_name") or r.get("username") or "").replace("<", "").replace(">", "")
+            flag = " 🚫" if r.get("is_banned") else ""
+            body += f"• <code>{r['user_id']}</code> {name}{flag}\n"
         pages = max(1, math.ceil(total / limit))
-        await cb.edit_message_text(body or "ɴᴏ ᴜsᴇʀs.",
-                                   reply_markup=kb.pagination_keyboard("adm:users", page + 1, pages))
+        # Add ban/unban toggle buttons per user.
+        ban_kb = kb.users_admin_keyboard(rows, page, pages)
+        await cb.edit_message_text(body or "ɴᴏ ᴜsᴇʀs.", reply_markup=ban_kb)
     elif section == "jobs":
         rows = await queries.list_recent_jobs(ctx.db, offset, limit)
         total = await queries.count_jobs(ctx.db)
@@ -320,12 +355,13 @@ async def _admin_dispatch(cb: CallbackQuery, ctx: HandlerContext, data: str) -> 
         await cb.edit_message_text(body or "ɴᴏ ᴊᴏʙs.",
                                    reply_markup=kb.pagination_keyboard("adm:jobs", page + 1, pages))
     elif section == "failed":
-        rows = await queries.list_recent_jobs(ctx.db, offset, limit)
-        rows = [r for r in rows if r["status"] == "FAILED"]
+        rows = await queries.list_failed_jobs(ctx.db, offset, limit)
+        total = await queries.count_jobs(ctx.db, "FAILED")
         body = "❌ <b>ꜰᴀɪʟᴇᴅ ᴊᴏʙs</b>\n\n"
         for r in rows:
-            body += f"• <code>{r['original_name']}</code> – {r.get('error','')[:40]}\n"
-        pages = max(1, math.ceil(len(rows) / limit))
+            err = (r.get("error") or "")[:40].replace("<", "")
+            body += f"• <code>{r['original_name']}</code> – {err}\n"
+        pages = max(1, math.ceil(total / limit))
         await cb.edit_message_text(body or "ɴᴏ ꜰᴀɪʟᴇᴅ ᴊᴏʙs.",
                                    reply_markup=kb.pagination_keyboard("adm:failed", page + 1, pages))
     await cb.answer()

@@ -22,17 +22,27 @@ def register(app: Client, ctx: HandlerContext) -> None:
             return
         text = M.WELCOME.format(max_mb=ctx.config.max_file_size // (1024 * 1024))
         is_admin = bool(user and user.get("is_admin"))
-        if ctx.config.start_video_url:
+        markup = kb.main_menu_keyboard(is_admin)
+
+        video_url = ctx.config.start_video_url
+        if video_url:
             try:
-                await message.reply_video(
-                    ctx.config.start_video_url,
+                # Reuse a cached file_id after the first send to avoid
+                # re-downloading the welcome video every time.
+                cached = getattr(app, "start_video_file_id", None)
+                sent = await message.reply_video(
+                    cached or video_url,
                     caption=text,
-                    reply_markup=kb.main_menu_keyboard(is_admin),
+                    reply_markup=markup,
+                    supports_streaming=True,
                 )
+                if sent and getattr(sent, "video", None) and not cached:
+                    app.start_video_file_id = sent.video.file_id  # type: ignore[attr-defined]
                 return
-            except Exception:
-                pass  # fall back to text
-        await message.reply(text, reply_markup=kb.main_menu_keyboard(is_admin), disable_web_page_preview=True)
+            except Exception as exc:
+                from utils.logging import get_logger
+                get_logger(__name__).warning("start_video_failed", extra={"error": str(exc)})
+        await message.reply(text, reply_markup=markup, disable_web_page_preview=True)
 
     @app.on_message(filters.command("help"))
     async def help_cmd(_client: Client, message: Message) -> None:
@@ -43,24 +53,20 @@ def register(app: Client, ctx: HandlerContext) -> None:
     async def cancel_cmd(_client: Client, message: Message) -> None:
         user = message.from_user
         await ctx.state.clear_user_state(user.id)
-        # Find the user's most recent active job and cancel it.
+        jm = getattr(app, "job_manager", None)
+        cancelled = 0
         try:
-            active = await queries.list_jobs_by_status(
-                ctx.db,
-                ["PENDING", "QUEUED", "DOWNLOADING", "RENAMING", "UPLOADING", "CLEANING"],
-                limit=20,
-            )
+            active = await queries.list_user_active_jobs(ctx.db, user.id)
             for job in active:
-                if int(job["user_id"]) == user.id:
-                    from services.jobs import JobManager  # local import avoids cycle
-                    # JobManager is injected via app; handled below via attribute.
-                    jm: JobManager = getattr(app, "job_manager", None)  # type: ignore
-                    if jm is not None:
-                        await jm.cancel_job(str(job["id"]), user.id)
-                    break
+                if jm is not None:
+                    await jm.cancel_job(str(job["id"]), user.id)
+                    cancelled += 1
         except Exception:
             pass
-        await message.reply(M.STATE_CLEARED)
+        if cancelled:
+            await message.reply(M.JOB_CANCELLED if cancelled == 1 else M.STATE_CLEARED)
+        else:
+            await message.reply(M.NOTHING_TO_CANCEL)
 
     @app.on_message(filters.command("history"))
     async def history_cmd(_client: Client, message: Message) -> None:

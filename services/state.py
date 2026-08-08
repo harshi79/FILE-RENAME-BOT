@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 import uuid
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import redis.asyncio as redis
 
@@ -110,8 +109,10 @@ class StateStore:
     # ── Queue ──────────────────────────────────────────────────────────
     async def enqueue_job(self, job_id: str) -> bool:
         async def _do():
-            async with self._redis.pipeline(transaction=True) as pipe:
-                await pipe.lpush(_job_queue_key(), job_id).expire(_job_queue_key(), 3600).execute()
+            pipe = self._redis.pipeline(transaction=True)
+            pipe.lpush(_job_queue_key(), job_id)
+            pipe.expire(_job_queue_key(), 3600)
+            await pipe.execute()
             return True
         return await self._safe(_do, False)
 
@@ -216,7 +217,6 @@ class StateStore:
         key = _rate_key(user_id, action)
 
         async def _do():
-            now = int(time.time())
             pipe = self._redis.pipeline()
             pipe.incr(key)
             pipe.expire(key, window, nx=True)
