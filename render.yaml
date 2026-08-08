@@ -19,10 +19,20 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
+      # DATABASE_URL must use the Render Postgres INTERNAL connection URL.
+      # `fromDatabase` + `connectionString` injects the internal URL used on
+      # Render's private network (not the public endpoint), and keeps the URL
+      # out of Git so it is never hardcoded. Both services live in this same
+      # Blueprint, so Render provisions them in the same workspace & region.
       - key: DATABASE_URL
         fromDatabase:
           name: file-renamer-db
           property: connectionString
+      # REDIS_URL must use the Render Key Value INTERNAL connection URL.
+      # `fromService` (type: kv) + `connectionString` injects the private,
+      # internal connection string used inside the Render private network.
+      # Do NOT use the public/external Key Value URL from the web service
+      # dashboard when the internal URL is available. Never hardcode it.
       - key: REDIS_URL
         fromService:
           type: kv

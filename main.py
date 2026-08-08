@@ -25,6 +25,7 @@ from services.rate_limit import RateLimiter
 from services.state import StateStore
 from services.storage import JobStorage
 from utils.logging import get_logger, setup_logging
+from utils.sanitize import mask_credentials
 from workers.processor import JobProcessor
 
 log = get_logger("main")
@@ -59,7 +60,10 @@ async def _run() -> None:
         health.stop()
         sys.exit(3)
 
-    await state.connect()  # tolerated if unavailable
+    # Redis is a soft dependency: unavailable is logged (with the real,
+    # credential-safe reason) and a background task keeps retrying with
+    # backoff until Redis returns. The bot and health server start regardless.
+    await state.connect()  # never raises; tolerated if unavailable
 
     # Clean stale dirs + recover interrupted/orphaned jobs.
     await startup_cleanup(db, state, storage, config.job_timeout)
@@ -128,7 +132,16 @@ async def _run() -> None:
     except RPCError as exc:
         log.error("telegram_start_failed", extra={"error": str(exc)})
     except Exception as exc:
-        log.error("fatal_startup_error", extra={"error": str(exc)})
+        # Log the real exception type/message (credential-safe) AND the full
+        # traceback so a startup failure is never silently swallowed.
+        log.error(
+            "fatal_startup_error",
+            extra={
+                "error_type": type(exc).__name__,
+                "error": mask_credentials(str(exc)),
+            },
+            exc_info=True,
+        )
     finally:
         log.info("shutting_down")
         health.set_healthy(False)
