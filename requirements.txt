@@ -1,0 +1,5 @@
+Pyrogram==2.0.106
+TgCrypto==1.2.5
+asyncpg==0.29.0
+redis==5.0.8
+python-dotenv==1.0.1
