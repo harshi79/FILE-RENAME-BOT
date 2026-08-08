@@ -13,6 +13,7 @@ import signal
 import sys
 
 from pyrogram import Client, idle
+from pyrogram.enums import ParseMode
 from pyrogram.errors import RPCError
 
 from bot.callbacks import callbacks
@@ -62,7 +63,7 @@ def build_pyrogram_client(config) -> Client:
         workers=8,  # bounded update handlers – low memory
         max_concurrent_transmissions=config.max_global_active_jobs,
         plugins=dict(enabled=False),
-        parse_mode="html",
+        parse_mode=ParseMode.HTML,
         sleep_threshold=60,
     )
 
