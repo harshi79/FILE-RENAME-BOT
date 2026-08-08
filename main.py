@@ -94,6 +94,12 @@ async def _run() -> None:
         sys.exit(2)
 
     setup_logging("INFO")
+    # Make Pyrogram dispatcher/handler exceptions visible at ERROR level in logs.
+    # (Our JsonFormatter will emit them; we only quiet the noisy INFO chatter.)
+    import logging as _logging
+    _logging.getLogger("pyrogram").setLevel(_logging.WARNING)
+    _logging.getLogger("pyrogram.dispatcher").setLevel(_logging.ERROR)
+    _logging.getLogger("pyrogram.session").setLevel(_logging.ERROR)
     log.info("starting", extra={"max_file_mb": config.max_file_size // (1024 * 1024)})
 
     # ── Health server starts early so Render sees the process is alive ──
@@ -139,6 +145,83 @@ async def _run() -> None:
     files.register(app, ctx)
     text_input.register(app, ctx)
     callbacks.register(app, ctx)
+
+    # Lightweight confirmation that handlers are wired (visible in logs even without messages).
+    try:
+        group_count = len(getattr(app.dispatcher, "groups", {}))
+        handler_count = sum(len(v) for v in getattr(app.dispatcher, "groups", {}).values())
+        log.info("handlers_registered", extra={"groups": group_count, "handlers": handler_count})
+    except Exception:
+        log.info("handlers_registered")
+
+    # Debug-safe raw update tracer (records ONLY metadata, never message text / secrets).
+    # Runs for every Telegram update; helps audit UPDATE → HANDLER path.
+    from pyrogram.handlers import RawUpdateHandler
+
+    async def _debug_update(_client, update, _users, _chats):
+        try:
+            utype = type(update).__name__
+            uid = None
+            cid = None
+            # Extract safe identifiers only (no content).
+            if hasattr(update, "message") and update.message:
+                m = update.message
+                if getattr(m, "from_user", None):
+                    uid = getattr(m.from_user, "id", None)
+                if getattr(m, "chat", None):
+                    cid = getattr(m.chat, "id", None)
+            elif hasattr(update, "from_user") and update.from_user:
+                uid = update.from_user.id
+            elif hasattr(update, "user_id"):
+                uid = update.user_id
+            # Callback specific
+            if "Callback" in utype or "callback" in utype.lower():
+                if hasattr(update, "from_user") and update.from_user:
+                    uid = update.from_user.id
+                if hasattr(update, "message") and update.message and getattr(update.message, "chat", None):
+                    cid = update.message.chat.id
+            log.info(
+                "telegram_update_received",
+                extra={
+                    "update_type": utype,
+                    "user_id": uid,
+                    "chat_id": cid,
+                    # handler name is not known at raw level; will be in handler entry logs
+                },
+            )
+        except Exception:
+            pass  # never let debug tracer break the pipeline
+
+    app.add_handler(RawUpdateHandler(_debug_update), group=-999)
+
+    # Global error handler so exceptions inside user handlers become visible
+    # (Pyrogram catches and we surface them).
+    async def _on_error(client, update, users, chats):
+        # This is invoked by dispatcher on handler exceptions in some paths.
+        # We log the update metadata + traceback.
+        try:
+            utype = type(update).__name__ if update is not None else "unknown"
+            uid = getattr(getattr(update, "from_user", None), "id", None) if update else None
+            cid = None
+            if update and hasattr(update, "message") and getattr(update, "message", None):
+                ch = getattr(update.message, "chat", None)
+                if ch:
+                    cid = ch.id
+            log.error("handler_exception_surface", extra={
+                "update_type": utype,
+                "user_id": uid,
+                "chat_id": cid,
+            }, exc_info=True)
+        except Exception:
+            log.error("handler_exception_surface", exc_info=True)
+
+    # Attach as a very low priority raw so it can observe but not consume normal flow.
+    # (In Pyrogram the primary mechanism is that uncaught exceptions are already logged
+    # at ERROR by dispatcher.handler_worker when level allows.)
+    try:
+        app.add_handler(RawUpdateHandler(_on_error), group=999)
+    except Exception:
+        pass
 
     # JobStorage is passed explicitly to the worker — never via Client.storage.
     processor = JobProcessor(app, db, state, jobs, storage, config)
