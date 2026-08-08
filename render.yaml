@@ -1,0 +1,57 @@
+# Render Blueprint for the Telegram File Renamer Bot.
+# Deploys as a Web Service so Render provides an HTTPS URL and can health-check
+# the process on the free tier. PostgreSQL + Key Value (Redis) are provisioned
+# automatically.
+services:
+  - type: web
+    name: file-renamer-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: file-renamer-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: kv
+          name: file-renamer-redis
+          property: connectionString
+      - key: MAX_FILE_SIZE_MB
+        value: "25"
+      - key: MAX_GLOBAL_ACTIVE_JOBS
+        value: "2"
+      - key: MAX_ACTIVE_JOBS_PER_USER
+        value: "1"
+      - key: MAX_RETRIES
+        value: "3"
+      - key: JOB_TIMEOUT
+        value: "300"
+      - key: HEALTH_PORT
+        value: "8080"
+      # Optional start video (Telegram file_id or public URL).
+      - key: START_VIDEO_URL
+        sync: false
+
+  - type: kv
+    name: file-renamer-redis
+    plan: free
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []
+
+databases:
+  - name: file-renamer-db
+    plan: free
+    databaseName: filerenamer
+    user: filerenamer
