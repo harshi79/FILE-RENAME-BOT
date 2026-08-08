@@ -11,6 +11,8 @@ import sys
 import time
 from typing import Any, Dict
 
+from utils.sanitize import mask_secrets
+
 
 # LogRecord attributes that are part of the standard record and should never be
 # dumped as structured extras (they are not error payloads).
@@ -30,8 +32,11 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
         }
-        if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+        # ``exc_info=True`` outside an ``except`` block yields (None, None, None),
+        # which formats to the useless "NoneType: None". Only emit ``exc`` when a
+        # real exception is attached, and mask any credentials in the traceback.
+        if record.exc_info and record.exc_info[0] is not None:
+            payload["exc"] = mask_secrets(self.formatException(record.exc_info))
         # Attach structured extras (logging .extra={...}) so error details are
         # never silently swallowed. Keys are stored on the record's __dict__.
         for key, value in record.__dict__.items():

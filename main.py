@@ -27,6 +27,7 @@ from services.jobs import JobManager
 from services.rate_limit import RateLimiter
 from services.state import StateStore
 from services.storage import JobStorage
+from utils.errors import install_exception_surface
 from utils.logging import get_logger, setup_logging
 from utils.sanitize import mask_credentials
 from workers.processor import JobProcessor
@@ -177,24 +178,6 @@ async def _run() -> None:
 
     app.add_handler(RawUpdateHandler(_debug_update), group=-999)
 
-    async def _on_error(client, update, users, chats):
-        try:
-            utype = type(update).__name__ if update is not None else "unknown"
-            uid = getattr(getattr(update, "from_user", None), "id", None) if update else None
-            cid = None
-            if update and hasattr(update, "message") and getattr(update, "message", None):
-                ch = getattr(update.message, "chat", None)
-                if ch:
-                    cid = ch.id
-            log.error("handler_exception_surface", extra={"update_type": utype, "user_id": uid, "chat_id": cid}, exc_info=True)
-        except Exception:
-            log.error("handler_exception_surface", exc_info=True)
-
-    try:
-        app.add_handler(RawUpdateHandler(_on_error), group=999)
-    except Exception:
-        pass
-
     # Yield to let pending add_handler tasks complete, then log reliable count.
     # This uses public API (dispatcher.groups) after an event-loop tick, without
     # mutating private Dispatcher internals.
@@ -207,6 +190,15 @@ async def _run() -> None:
             log.warning("handlers_registered_zero", extra={"groups": group_count, "handlers": handler_count})
     except Exception:
         log.info("handlers_registered")
+
+    # Real exception surfacing: each registered callback (Message, CallbackQuery
+    # and raw) is wrapped so a failure logs the ORIGINAL exception type, message
+    # and traceback before being re-raised. Registration itself is unchanged.
+    try:
+        wrapped = install_exception_surface(app)
+        log.info("exception_surface_installed", extra={"wrapped": wrapped})
+    except Exception as exc:
+        log.warning("exception_surface_install_failed", extra={"error": str(exc)})
 
     # JobStorage is passed explicitly to the worker — never via Client.storage.
     processor = JobProcessor(app, db, state, jobs, storage, config)
