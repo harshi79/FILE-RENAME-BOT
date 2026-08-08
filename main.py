@@ -7,6 +7,7 @@ client. Designed to run on a Render free web service with ~512 MB RAM.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 
@@ -29,6 +30,59 @@ from utils.sanitize import mask_credentials
 from workers.processor import JobProcessor
 
 log = get_logger("main")
+
+# Session files live under the temp tree. Render's filesystem is ephemeral,
+# which is fine for a bot-token session (re-auth is automatic via bot_token).
+SESSION_NAME = "file_renamer_bot"
+SESSION_SUBDIR = "session"
+
+
+def session_workdir(config) -> str:
+    """Return (and create) the Pyrogram session workdir under temp_dir."""
+    path = str(config.temp_dir / SESSION_SUBDIR)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def build_pyrogram_client(config) -> Client:
+    """
+    Construct the Pyrogram Client with a proper session backend.
+
+    JobStorage must NEVER be passed as ``storage=`` or assigned to
+    ``Client.storage`` — that attribute is Pyrogram's session store and
+    must expose ``open()`` / ``save()`` / ``close()``.
+    """
+    return Client(
+        name=SESSION_NAME,
+        api_id=config.api_id,
+        api_hash=config.api_hash,
+        bot_token=config.bot_token,
+        workdir=session_workdir(config),
+        workers=8,  # bounded update handlers – low memory
+        max_concurrent_transmissions=config.max_global_active_jobs,
+        plugins=dict(enabled=False),
+        parse_mode="html",
+        sleep_threshold=60,
+    )
+
+
+def attach_app_services(app: Client, *, jobs, storage: JobStorage, state,
+                        db, config) -> None:
+    """
+    Hang application services off the Client for handler convenience.
+
+    Critical: JobStorage is attached as ``app.job_storage``, NEVER as
+    ``app.storage``. Overwriting ``app.storage`` replaces Pyrogram's
+    session backend and crashes at ``await app.start()`` with:
+        AttributeError: 'JobStorage' object has no attribute 'open'
+    """
+    # Cache for the start-video file_id (never stores user files).
+    app.start_video_file_id = None  # type: ignore[attr-defined]
+    app.job_manager = jobs  # type: ignore[attr-defined]
+    app.job_storage = storage  # type: ignore[attr-defined]
+    app.state_store = state  # type: ignore[attr-defined]
+    app.db = db  # type: ignore[attr-defined]
+    app.config = config  # type: ignore[attr-defined]
 
 
 async def _run() -> None:
@@ -72,29 +126,11 @@ async def _run() -> None:
     jobs = JobManager(state, db, config)
     rate_limiter = RateLimiter(state, config)
 
-    # ── Pyrogram client (in-memory session, no disk session file) ──────
-    app = Client(
-        "file_renamer_bot",
-        api_id=config.api_id,
-        api_hash=config.api_hash,
-        bot_token=config.bot_token,
-        in_memory=True,
-        workers=8,           # bounded update handlers – low memory
-        max_concurrent_transmissions=config.max_global_active_jobs,
-        plugins=dict(enabled=False),
-        workdir="/tmp",
-        parse_mode="html",
-        sleep_threshold=60,
+    # ── Pyrogram client (proper session storage — not JobStorage) ──────
+    app = build_pyrogram_client(config)
+    attach_app_services(
+        app, jobs=jobs, storage=storage, state=state, db=db, config=config,
     )
-    # Small in-memory cache for the start video file_id (avoids re-downloading
-    # the welcome video on every /start). Never stores user files.
-    app.start_video_file_id = None  # type: ignore[attr-defined]
-    # Expose services to handlers via the app object.
-    app.job_manager = jobs          # type: ignore[attr-defined]
-    app.storage = storage           # type: ignore[attr-defined]
-    app.state_store = state         # type: ignore[attr-defined]
-    app.db = db                     # type: ignore[attr-defined]
-    app.config = config             # type: ignore[attr-defined]
 
     ctx = HandlerContext(app, db, state, rate_limiter, config)
 
@@ -104,6 +140,7 @@ async def _run() -> None:
     text_input.register(app, ctx)
     callbacks.register(app, ctx)
 
+    # JobStorage is passed explicitly to the worker — never via Client.storage.
     processor = JobProcessor(app, db, state, jobs, storage, config)
 
     loop = asyncio.get_running_loop()
