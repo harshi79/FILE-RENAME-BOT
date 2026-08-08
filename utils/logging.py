@@ -12,6 +12,16 @@ import time
 from typing import Any, Dict
 
 
+# LogRecord attributes that are part of the standard record and should never be
+# dumped as structured extras (they are not error payloads).
+_RESERVED = {
+    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+    "created", "msecs", "relativeCreated", "thread", "threadName",
+    "processName", "process", "taskName", "message", "asctime",
+}
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: Dict[str, Any] = {
@@ -22,8 +32,11 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
-        # Attach safe structured extras if present.
-        for key, value in getattr(record, "__extra__", {}).items() if False else []:
+        # Attach structured extras (logging .extra={...}) so error details are
+        # never silently swallowed. Keys are stored on the record's __dict__.
+        for key, value in record.__dict__.items():
+            if key in _RESERVED or key.startswith("_"):
+                continue
             payload[key] = value
         return json.dumps(payload, ensure_ascii=False)
 

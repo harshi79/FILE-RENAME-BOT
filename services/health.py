@@ -67,6 +67,8 @@ class HealthServer:
 
     def start(self) -> None:
         self._server = ThreadingHTTPServer((self.host, self.port), _Handler)
+        # Reflect the actual bound port (useful when port=0 / ephemeral).
+        self.port = int(self._server.server_address[1])
         self._server.daemon_threads = True
         self._thread = threading.Thread(
             target=self._server.serve_forever,
