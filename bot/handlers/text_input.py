@@ -31,6 +31,13 @@ def register(app: Client, ctx: HandlerContext) -> None:
         "start", "help", "cancel", "history", "settings", "admin"
     ]) & filters.private)
     async def on_text(_client: Client, message: Message) -> None:
+        try:
+            uid = getattr(message.from_user, "id", None) if message.from_user else None
+            cid = getattr(message.chat, "id", None) if message.chat else None
+            log.info("handler_entry", extra={"handler": "on_text", "user_id": uid, "chat_id": cid})
+        except Exception:
+            pass
+
         user = message.from_user
         if user is None:
             return

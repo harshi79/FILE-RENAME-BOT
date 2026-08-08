@@ -29,6 +29,16 @@ def register(app: Client, ctx: HandlerContext) -> None:
             return
         user_id = cb.from_user.id
 
+        try:
+            log.info("handler_entry", extra={
+                "handler": "on_callback",
+                "user_id": user_id,
+                "chat_id": getattr(getattr(cb, "message", None), "chat", None) and getattr(cb.message.chat, "id", None) or None,
+                "callback_data": (cb.data or "")[:32] if cb.data else None,  # prefix only, never full secrets
+            })
+        except Exception:
+            pass
+
         # Global callback rate limit (admins exempt).
         if not ctx.config.is_admin(user_id):
             rl = await ctx.rate_limiter.check(user_id, "callback")

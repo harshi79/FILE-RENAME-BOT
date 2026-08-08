@@ -378,7 +378,10 @@ class StateStore:
     async def rate_limit_check(self, user_id: int, action: str, limit: int, window: int) -> tuple:
         """
         Returns (allowed: bool, retry_after_seconds: int).
+        Completely safe when Redis is down (fail-open).
         """
+        if self._redis is None:
+            return True, 0
         key = _rate_key(user_id, action)
 
         async def _do():
@@ -393,7 +396,7 @@ class StateStore:
             return True, 0
         try:
             return await _do()
-        except (redis.RedisError, OSError, asyncio.TimeoutError) as exc:
+        except (redis.RedisError, OSError, asyncio.TimeoutError, AttributeError) as exc:
             self._request_reconnect()
             log.warning("ratelimit_redis_error", extra=_short_reason(exc))
             # Fail open so a Redis outage never blocks all users.

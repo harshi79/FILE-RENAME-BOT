@@ -31,6 +31,13 @@ def register(app: Client, ctx: HandlerContext) -> None:
                     filters.audio | filters.animation | filters.voice |
                     filters.video_note)
     async def on_file(_client: Client, message: Message) -> None:
+        try:
+            uid = getattr(message.from_user, "id", None) if message.from_user else None
+            cid = getattr(message.chat, "id", None) if message.chat else None
+            log.info("handler_entry", extra={"handler": "on_file", "user_id": uid, "chat_id": cid})
+        except Exception:
+            pass
+
         if await ctx.rate_limited(message, "file_submit"):
             return
         user = await ctx.ensure_user(message)

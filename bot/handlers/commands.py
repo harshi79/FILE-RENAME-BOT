@@ -11,11 +11,24 @@ from bot.handlers.common import HandlerContext
 from bot.keyboards import keyboards as kb
 from database import queries
 
+from utils.logging import get_logger
+log = get_logger(__name__)
+
 
 def register(app: Client, ctx: HandlerContext) -> None:
 
     @app.on_message(filters.command("start"))
     async def start_cmd(_client: Client, message: Message) -> None:
+        # Debug-safe entry log (no content)
+        try:
+            uid = getattr(message.from_user, "id", None) if message.from_user else None
+            cid = getattr(message.chat, "id", None) if message.chat else None
+            log.info("handler_entry", extra={"handler": "start_cmd", "user_id": uid, "chat_id": cid})
+        except Exception:
+            pass
+
+        # /start must NEVER require Redis. All paths below use only DB (or hard-coded config).
+        # Even if StateStore reports unavailable we still answer the welcome message.
         user = await ctx.ensure_user(message)
         if user and user.get("is_banned"):
             await message.reply(M.ERR_BANNED)
