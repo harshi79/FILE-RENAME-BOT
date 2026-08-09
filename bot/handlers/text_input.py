@@ -17,8 +17,10 @@ from bot import messages as M
 from bot.handlers.common import HandlerContext
 from bot.keyboards import keyboards as kb
 from core import filename as fn
+from core import file_editor as ed
 from core import rename as rn
-from core.validation import validate_extension_change
+from core.media import MediaInfo
+from core.validation import validate_extension_change, validate_file
 from database import queries
 from utils.logging import get_logger
 
@@ -28,7 +30,8 @@ log = get_logger(__name__)
 def register(app: Client, ctx: HandlerContext) -> None:
 
     @app.on_message(filters.text & ~filters.command([
-        "start", "help", "cancel", "history", "settings", "admin"
+        "start", "help", "cancel", "history", "settings", "admin",
+        "paste", "replace", "detail",
     ]) & filters.private)
     async def on_text(_client: Client, message: Message) -> None:
         try:
@@ -75,6 +78,8 @@ def register(app: Client, ctx: HandlerContext) -> None:
                 await batch_whitespace(message, state)
             elif action == "batch_case":
                 await batch_case(message, state, raw)
+            elif action == "editor_replace":
+                await editor_replace_lines(message, state)
             else:
                 await ctx.state.clear_user_state(user.id)
         except ValueError as exc:
@@ -114,6 +119,48 @@ def register(app: Client, ctx: HandlerContext) -> None:
             raise ValueError("that extension is not allowed (media/archive).")
         plan = rn.plan_extension(original, ext)
         await enqueue_single(message, job_id, plan, "extension")
+
+    # ── File editor follow-up (/replace needs the lines in a next message) ──
+    async def editor_replace_lines(message: Message, state: Dict):
+        """
+        Handle the follow-up message that supplies /replace replacement lines.
+
+        Uses the RAW message text (never the stripped ``raw`` variable) so
+        leading/trailing spaces inside replacement lines are preserved.
+        """
+        from bot.handlers.file_editor import editor_run_replace, editor_unsupported_text
+        target = state.get("editor") or {}
+        try:
+            selector = ed.parse_line_selector(str(target.get("selector", "")))
+            replacements = ed.split_message_lines(message.text or "")
+            if len(replacements) != selector.width:
+                await message.reply(ed.count_mismatch_text(selector.width, len(replacements)))
+                return
+            info = MediaInfo(
+                filename=target.get("filename") or "",
+                size=int(target.get("size", 0) or 0),
+                mime_type=target.get("mime_type") or "",
+                media_type=target.get("media_type") or "document",
+                file_id=target.get("file_id") or "",
+                file_ref=target.get("file_ref"),
+                chat_id=message.chat.id,
+                message_id=0,
+            )
+            result = validate_file(
+                filename=info.filename,
+                size=info.size,
+                mime_type=info.mime_type,
+                telegram_media_type=info.media_type,
+                max_size=ctx.config.max_file_size,
+            )
+            if not result.ok:
+                await ctx.state.clear_user_state(message.from_user.id)
+                await message.reply(editor_unsupported_text(result, ctx))
+                return
+            await ctx.state.clear_user_state(message.from_user.id)
+            await editor_run_replace(ctx.app, ctx, message, info, selector, replacements)
+        except ed.EditorError as exc:
+            await message.reply(str(exc), disable_web_page_preview=True)
 
     # ── Batch operations ──────────────────────────────────────────────
     async def batch_rename(message: Message, state: Dict, raw: str):

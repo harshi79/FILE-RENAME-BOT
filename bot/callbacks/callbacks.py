@@ -453,6 +453,9 @@ async def _show_commands(cb: CallbackQuery, ctx: HandlerContext, user_id: int) -
         ("/cancel", "Clear pending state or cancel active jobs", "When stuck in rename flow"),
         ("/history", "View your rename history (paginated)", "Check past renames"),
         ("/settings", "Toggle case/ws/num preferences", "Customize batch behavior"),
+        ("/paste", "Show exact line(s) of a text file (reply to it)", "Reply to file: /paste 1, /paste 1-10, /paste full"),
+        ("/replace", "Replace line(s) of a text file (reply to it)", "Reply to file: /replace 2 New Line"),
+        ("/detail", "File info: size, lines, encoding, branding (reply to it)", "Reply to file: /detail"),
     ]
     if is_admin:
         cmds.append(("/admin", "Open admin panel (users/jobs/stats)", "Admin only"))

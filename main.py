@@ -17,7 +17,7 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import RPCError
 
 from bot.callbacks import callbacks
-from bot.handlers import commands, files, text_input
+from bot.handlers import commands, file_editor, files, text_input
 from bot.handlers.common import HandlerContext
 from config import ConfigurationError, get_config
 from database.database import Database
@@ -145,6 +145,7 @@ async def _run() -> None:
     files.register(app, ctx)
     text_input.register(app, ctx)
     callbacks.register(app, ctx)
+    file_editor.register(app, ctx)
 
     # Debug-safe raw update tracer (records ONLY metadata, never message text / secrets).
     from pyrogram.handlers import RawUpdateHandler
