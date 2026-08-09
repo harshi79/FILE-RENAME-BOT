@@ -15,9 +15,35 @@ from bot import messages as M
 from bot.handlers.common import HandlerContext
 from bot.keyboards import keyboards as kb
 from database import queries
+from utils.errors import is_message_not_modified, log_handler_exception
 from utils.logging import get_logger
 
 log = get_logger(__name__)
+
+
+async def safe_edit_message_text(cb: CallbackQuery, text: str, **kwargs):
+    """
+    Single edit path for every callback screen.
+
+    Telegram answers ``400 MESSAGE_NOT_MODIFIED`` when the new content is
+    identical to what is already displayed. That happens routinely on
+    idempotent menus (``adm:stats``, ``adm:jobs:0``, pagination re-taps) and is
+    harmless, so it is treated as a no-op: logged at DEBUG, never as ERROR, and
+    never propagated back to the dispatcher.
+
+    Every other Telegram/API error is re-raised unchanged so existing error
+    handling keeps working.
+    """
+    try:
+        return await cb.edit_message_text(text, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - only MESSAGE_NOT_MODIFIED is absorbed
+        if is_message_not_modified(exc):
+            log.debug("message_not_modified_ignored", extra={
+                "user_id": getattr(getattr(cb, "from_user", None), "id", None),
+                "callback_data": (cb.data or "")[:32] if getattr(cb, "data", None) else None,
+            })
+            return None
+        raise
 
 
 def register(app: Client, ctx: HandlerContext) -> None:
@@ -50,7 +76,13 @@ def register(app: Client, ctx: HandlerContext) -> None:
         try:
             await _dispatch(app, ctx, cb, data, user_id)
         except Exception as exc:
-            log.error("callback_error", extra={"data": data, "error": str(exc)})
+            # CallbackQuery errors are handled here (the user gets an alert), so
+            # surface the ORIGINAL exception type/message/traceback right where
+            # it is caught — otherwise the real cause would never be logged.
+            log_handler_exception(
+                exc, logger=log, event="callback_error",
+                handler="on_callback", user_id=user_id, data=data,
+            )
             try:
                 await cb.answer(M.ERR_BAD_CALLBACK, show_alert=True)
             except Exception:
@@ -89,14 +121,14 @@ def register(app: Client, ctx: HandlerContext) -> None:
                 else:
                     await cb.answer(M.JOB_CANCELLED, show_alert=False)
                     try:
-                        await cb.edit_message_text(M.JOB_CANCELLED)
+                        await safe_edit_message_text(cb, M.JOB_CANCELLED)
                     except Exception:
                         pass
             return
 
         if data == "cancel_state":
             await ctx.state.clear_user_state(user_id)
-            await cb.edit_message_text(M.STATE_CLEARED)
+            await safe_edit_message_text(cb, M.STATE_CLEARED)
             return
 
         # ── Single-file actions ───────────────────────────────────────
@@ -108,7 +140,8 @@ def register(app: Client, ctx: HandlerContext) -> None:
             state["action"] = "single_rename"
             state["single"] = {"job_id": job_id, "filename": job["original_name"]}
             await ctx.state.set_user_state(user_id, state)
-            await cb.edit_message_text(
+            await safe_edit_message_text(
+                cb,
                 M.RENAME_PROMPT.format(current=job["original_name"]),
                 reply_markup=kb.cancel_keyboard(),
             )
@@ -123,7 +156,8 @@ def register(app: Client, ctx: HandlerContext) -> None:
             state["action"] = "single_ext"
             state["single"] = {"job_id": job_id, "filename": job["original_name"]}
             await ctx.state.set_user_state(user_id, state)
-            await cb.edit_message_text(
+            await safe_edit_message_text(
+                cb,
                 M.EXTENSION_PROMPT.format(current=job["original_name"]),
                 reply_markup=kb.cancel_keyboard(),
             )
@@ -156,7 +190,8 @@ def register(app: Client, ctx: HandlerContext) -> None:
                 return
             if action == "batch_case":
                 # Easier: ask for lower/upper/title by using a tiny inline.
-                await cb.edit_message_text(
+                await safe_edit_message_text(
+                    cb,
                     "🔠 ꜱᴇɴᴅ <code>lower</code>, <code>upper</code> ᴏʀ <code>title</code>:",
                     reply_markup=kb.cancel_keyboard(),
                 )
@@ -168,7 +203,7 @@ def register(app: Client, ctx: HandlerContext) -> None:
             state["action"] = action
             await ctx.state.set_user_state(user_id, state)
             if prompt:
-                await cb.edit_message_text(prompt, reply_markup=kb.cancel_keyboard())
+                await safe_edit_message_text(cb, prompt, reply_markup=kb.cancel_keyboard())
             await cb.answer()
             return
 
@@ -188,7 +223,7 @@ def register(app: Client, ctx: HandlerContext) -> None:
                 except Exception:
                     pass
             await ctx.state.clear_user_state(user_id)
-            await cb.edit_message_text(M.STATE_CLEARED)
+            await safe_edit_message_text(cb, M.STATE_CLEARED)
             return
 
         # Admin ban/unban toggle: "ban:<user_id>"
@@ -208,7 +243,8 @@ def register(app: Client, ctx: HandlerContext) -> None:
         # ── Settings / history / admin ────────────────────────────────
         if data == "settings":
             s = await queries.get_settings(ctx.db, user_id)
-            await cb.edit_message_text(
+            await safe_edit_message_text(
+                cb,
                 M.SETTINGS_MENU.format(
                     case_mode=s.get("case_mode", "none"),
                     ws_mode=s.get("ws_mode", "off"),
@@ -223,7 +259,8 @@ def register(app: Client, ctx: HandlerContext) -> None:
             field = data.split(":", 1)[1]
             await _toggle_setting(ctx, user_id, field)
             s = await queries.get_settings(ctx.db, user_id)
-            await cb.edit_message_text(
+            await safe_edit_message_text(
+                cb,
                 M.SETTINGS_MENU.format(
                     case_mode=s.get("case_mode", "none"),
                     ws_mode=s.get("ws_mode", "off"),
@@ -259,7 +296,8 @@ async def _assert_owner(ctx: HandlerContext, job_id: str, user_id: int) -> None:
 
 async def _show_main(cb: CallbackQuery, ctx: HandlerContext, user_id: int) -> None:
     text = M.WELCOME.format(max_mb=ctx.config.max_file_size // (1024 * 1024))
-    await cb.edit_message_text(
+    await safe_edit_message_text(
+        cb,
         text,
         reply_markup=kb.main_menu_keyboard(ctx.config.is_admin(user_id)),
         disable_web_page_preview=True,
@@ -291,7 +329,8 @@ async def _show_history(cb: CallbackQuery, ctx: HandlerContext, user_id: int, pa
     offset = (page - 1) * ctx.config.history_page_size
     rows = await queries.list_history(ctx.db, user_id, offset, ctx.config.history_page_size)
     text = M.render_history(rows, page, pages)
-    await cb.edit_message_text(
+    await safe_edit_message_text(
+        cb,
         text, reply_markup=kb.pagination_keyboard("hist", page, pages),
         disable_web_page_preview=True,
     )
@@ -307,7 +346,7 @@ async def _enqueue_batch_from_cb(app, ctx, cb, items, plans, operation: str) -> 
             queued += 1
     await ctx.state.clear_user_state(cb.from_user.id)
     try:
-        await cb.edit_message_text(M.JOB_BATCH_DONE.format(ok=queued, total=len(items)))
+        await safe_edit_message_text(cb, M.JOB_BATCH_DONE.format(ok=queued, total=len(items)))
     except Exception:
         pass
     await cb.answer()
@@ -325,7 +364,7 @@ async def _admin_dispatch(cb: CallbackQuery, ctx: HandlerContext, data: str) -> 
             completed=stats.get("completed", 0), failed=stats.get("failed", 0),
             queued=stats.get("queued", 0), active=stats.get("active", 0),
         )
-        await cb.edit_message_text(text, reply_markup=kb.admin_keyboard())
+        await safe_edit_message_text(cb, text, reply_markup=kb.admin_keyboard())
         await cb.answer()
         return
 
@@ -336,7 +375,7 @@ async def _admin_dispatch(cb: CallbackQuery, ctx: HandlerContext, data: str) -> 
             "completed": stats.get("completed", 0), "failed": stats.get("failed", 0),
             "queued": stats.get("queued", 0), "active": stats.get("active", 0),
         })
-        await cb.edit_message_text(text, reply_markup=kb.admin_keyboard())
+        await safe_edit_message_text(cb, text, reply_markup=kb.admin_keyboard())
         await cb.answer()
         return
 
@@ -354,7 +393,7 @@ async def _admin_dispatch(cb: CallbackQuery, ctx: HandlerContext, data: str) -> 
         pages = max(1, math.ceil(total / limit))
         # Add ban/unban toggle buttons per user.
         ban_kb = kb.users_admin_keyboard(rows, page, pages)
-        await cb.edit_message_text(body or "ɴᴏ ᴜsᴇʀs.", reply_markup=ban_kb)
+        await safe_edit_message_text(cb, body or "ɴᴏ ᴜsᴇʀs.", reply_markup=ban_kb)
     elif section == "jobs":
         rows = await queries.list_recent_jobs(ctx.db, offset, limit)
         total = await queries.count_jobs(ctx.db)
@@ -362,8 +401,9 @@ async def _admin_dispatch(cb: CallbackQuery, ctx: HandlerContext, data: str) -> 
         for r in rows:
             body += f"• <code>{r['original_name']}</code> [{r['status']}]\n"
         pages = max(1, math.ceil(total / limit))
-        await cb.edit_message_text(body or "ɴᴏ ᴊᴏʙs.",
-                                   reply_markup=kb.pagination_keyboard("adm:jobs", page + 1, pages))
+        await safe_edit_message_text(
+            cb, body or "ɴᴏ ᴊᴏʙs.",
+            reply_markup=kb.pagination_keyboard("adm:jobs", page + 1, pages))
     elif section == "failed":
         rows = await queries.list_failed_jobs(ctx.db, offset, limit)
         total = await queries.count_jobs(ctx.db, "FAILED")
@@ -372,6 +412,7 @@ async def _admin_dispatch(cb: CallbackQuery, ctx: HandlerContext, data: str) -> 
             err = (r.get("error") or "")[:40].replace("<", "")
             body += f"• <code>{r['original_name']}</code> – {err}\n"
         pages = max(1, math.ceil(total / limit))
-        await cb.edit_message_text(body or "ɴᴏ ꜰᴀɪʟᴇᴅ ᴊᴏʙs.",
-                                   reply_markup=kb.pagination_keyboard("adm:failed", page + 1, pages))
+        await safe_edit_message_text(
+            cb, body or "ɴᴏ ꜰᴀɪʟᴇᴅ ᴊᴏʙs.",
+            reply_markup=kb.pagination_keyboard("adm:failed", page + 1, pages))
     await cb.answer()
