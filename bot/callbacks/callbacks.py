@@ -99,6 +99,21 @@ def register(app: Client, ctx: HandlerContext) -> None:
             await _show_main(cb, ctx, user_id)
             return
 
+        # ── New UX: Help (paginated) and Commands ─────────────────────
+        if data == kb.CB_HELP or data.startswith("help:"):
+            page = 1
+            if data.startswith("help:"):
+                try:
+                    page = max(1, min(6, int(data.split(":", 1)[1])))
+                except Exception:
+                    page = 1
+            await _show_help(cb, ctx, user_id, page)
+            return
+
+        if data == kb.CB_COMMANDS:
+            await _show_commands(cb, ctx, user_id)
+            return
+
         # Close deletes the menu message.
         if data.startswith("close:"):
             job_id = data.split(":", 1)[1]
@@ -416,3 +431,40 @@ async def _admin_dispatch(cb: CallbackQuery, ctx: HandlerContext, data: str) -> 
             cb, body or "ɴᴏ ꜰᴀɪʟᴇᴅ ᴊᴏʙs.",
             reply_markup=kb.pagination_keyboard("adm:failed", page + 1, pages))
     await cb.answer()
+async def _show_help(cb: CallbackQuery, ctx: HandlerContext, user_id: int, page: int) -> None:
+    """Show paginated detailed help. Uses safe_edit to avoid MESSAGE_NOT_MODIFIED."""
+    max_pages = len(M.HELP_PAGES)
+    page = max(1, min(page, max_pages))
+    text = M.HELP_PAGES[page - 1]
+    # Inject max_mb into page 6 if present
+    if "{max_mb}" in text:
+        text = text.format(max_mb=ctx.config.max_file_size // (1024 * 1024))
+    kb_help = kb.pagination_keyboard("help", page, max_pages)
+    await safe_edit_message_text(cb, text, reply_markup=kb_help, disable_web_page_preview=True)
+    await cb.answer()
+
+
+async def _show_commands(cb: CallbackQuery, ctx: HandlerContext, user_id: int) -> None:
+    """Show supported user commands (only real implemented ones)."""
+    is_admin = ctx.config.is_admin(user_id)
+    cmds = [
+        ("/start", "Show main menu + welcome", "First contact / reset view"),
+        ("/help", "Show brief help text", "Quick reference"),
+        ("/cancel", "Clear pending state or cancel active jobs", "When stuck in rename flow"),
+        ("/history", "View your rename history (paginated)", "Check past renames"),
+        ("/settings", "Toggle case/ws/num preferences", "Customize batch behavior"),
+    ]
+    if is_admin:
+        cmds.append(("/admin", "Open admin panel (users/jobs/stats)", "Admin only"))
+
+    body = "⌨️ <b>ꜱᴜᴘᴘᴏʀᴛᴇᴅ ᴄᴏᴍᴍᴀɴᴅꜱ</b>\n\n"
+    for cmd, desc, when in cmds:
+        body += f"<b>{cmd}</b>\n{desc}\n<i>ᴜꜱᴇ: {when}</i>\n\n"
+    body += "ᴜꜱᴇ ᴍᴇɴᴜ ʙᴜᴛᴛᴏɴꜱ ꜰᴏʀ ᴍᴏꜱᴛ ᴀᴄᴛɪᴏɴꜱ."
+
+    await safe_edit_message_text(
+        cb, body, reply_markup=kb.pagination_keyboard("main", 0, 1),  # reuse style, back to main
+        disable_web_page_preview=True
+    )
+    await cb.answer()
+
