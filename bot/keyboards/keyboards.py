@@ -27,6 +27,10 @@ CB_SETTINGS = "settings"
 CB_HISTORY = "history"
 CB_ADMIN = "admin"
 CB_PAGE = "page"
+CB_HELP = "help"
+CB_COMMANDS = "commands"
+CB_HELP = "help"
+CB_COMMANDS = "commands"
 
 
 def file_actions_keyboard(job_id: str) -> InlineKeyboardMarkup:
@@ -73,6 +77,11 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
 
 def main_menu_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("✏️ ʀᴇɴᴀᴍᴇ / ꜱᴇɴᴅ ꜰɪʟᴇ", callback_data="noop")],  # visual hint only
+        [
+            InlineKeyboardButton("📖 ʜᴇʟᴘ", callback_data=CB_HELP),
+            InlineKeyboardButton("⌨️ ᴄᴏᴍᴍᴀɴᴅꜱ", callback_data=CB_COMMANDS),
+        ],
         [
             InlineKeyboardButton("📜 ʜɪsᴛᴏʀʏ", callback_data=CB_HISTORY),
             InlineKeyboardButton("⚙️ sᴇᴛᴛɪɴɢs", callback_data=CB_SETTINGS),
